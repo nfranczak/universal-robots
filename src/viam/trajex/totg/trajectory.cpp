@@ -163,14 +163,17 @@ enum class integration_event : std::uint8_t {
         s_ddot_max = std::min(s_ddot_max, max_from_joint);
     }
 
-    if (s_ddot_min - s_ddot_max > epsilon) [[unlikely]] {  // s_ddot_min is greater than s_ddot_max by epsilon
-        throw std::runtime_error{"TOTG algorithm error: acceleration bounds are infeasible"};
-    }
 
     // Handle degenerate case where bounds are nearly equal (singularity/zero-acceleration point).
     if (s_ddot_max - s_ddot_min < epsilon) {
         s_ddot_min = s_ddot_max = std::min(s_ddot_min, s_ddot_max);
     }
+
+    if (s_ddot_min - s_ddot_max > epsilon) [[unlikely]] {  // s_ddot_min is greater than s_ddot_max by epsilon
+        throw std::runtime_error{"TOTG algorithm error: acceleration bounds are infeasible"};
+    }
+
+
     assert(s_ddot_min <= s_ddot_max);
 
     return result{s_ddot_min, s_ddot_max};
@@ -227,6 +230,146 @@ enum class integration_event : std::uint8_t {
         throw std::runtime_error{
             "compute_velocity_limit_derivative: denominator near zero for limiting joint - "
             "velocity limit curve derivative is numerically undefined (joint barely moving along path)"};
+    }
+
+    return numerator / denominator;
+}
+
+// Computes the third derivative of path configuration (jerk) with respect to arc length.
+// For circular segments: f'''(s) = -(1/r^2) * f'(s), where r is the radius.
+// For linear segments: f'''(s) = 0 (since f''(s) = 0).
+// Takes a segment view to determine which case applies.
+[[gnu::pure]] xt::xarray<double> compute_jerk(const path::segment::view& segment_view,
+                                               [[maybe_unused]] arc_length s,
+                                               const xt::xarray<double>& q_prime,
+                                               double epsilon) {
+    xt::xarray<double> q_triple_prime = xt::zeros_like(q_prime);
+
+    segment_view.visit([&](const auto& seg_data) {
+        using segment_type = std::decay_t<decltype(seg_data)>;
+        if constexpr (std::is_same_v<segment_type, path::segment::circular>) {
+            // For circular segments: f'''(s) = -(1/r^2) * f'(s)
+            const double radius = seg_data.radius;
+            if (std::abs(radius) > epsilon) {
+                const double inv_radius_squared = 1.0 / (radius * radius);
+                q_triple_prime = -inv_radius_squared * q_prime;
+            }
+        }
+        // For linear segments, q_triple_prime remains zero
+    });
+
+    return q_triple_prime;
+}
+
+// Computes the derivative of the acceleration limit curve in the phase plane.
+// This is d/ds s_dot_max_acc(s), which tells us the slope of the acceleration limit curve.
+// Used in switching point validation to check if a discontinuity or extremum is a valid switching point.
+// Implements the derivative of equation 31 from Kunz & Stilman paper.
+//
+// The derivation follows the PDF "derivative_of_eq_31_totg.pdf":
+// For the active constraint pair (i, j), we have s_dot_max_acc = sqrt(N/D) where:
+//   N(s) = q_ddot_max_i/|q'_i| + q_ddot_max_j/|q'_j|
+//   D(s) = |q''_i/q'_i - q''_j/q'_j|
+//
+// The derivative is: d/ds s_dot_max_acc = (N'*D - N*D') / (2*D^(3/2) * sqrt(N))
+//
+// Where:
+//   N'(s) = -q_ddot_max_i*q''_i/(|q'_i|*q'_i) - q_ddot_max_j*q''_j/(|q'_j|*q'_j)
+//   D'(s) = sgn(g) * g'   where g = q''_i/q'_i - q''_j/q'_j
+//   g'(s) = (q'''_i*q'_i - (q''_i)^2)/(q'_i)^2 - (q'''_j*q'_j - (q''_j)^2)/(q'_j)^2
+//
+// See derivative_of_eq_31_totg.pdf for full step-by-step derivation.
+[[gnu::pure]] double compute_acceleration_limit_derivative(const path::segment::view& segment_view,
+                                                           arc_length s,
+                                                           const xt::xarray<double>& q_prime,
+                                                           const xt::xarray<double>& q_double_prime,
+                                                           const xt::xarray<double>& q_ddot_max,
+                                                           double epsilon) {
+    // Compute the third derivative (jerk)
+    const auto q_triple_prime = compute_jerk(segment_view, s, q_prime, epsilon);
+    // Find the limiting constraint pair (i, j) that achieves the minimum in equation 31
+    double min_limit = std::numeric_limits<double>::infinity();
+    size_t limiting_i = 0;
+    size_t limiting_j = 0;
+
+    // First, check pairwise constraints (first term in equation 31)
+    for (size_t i = 0; i < q_prime.size(); ++i) {
+        if (std::abs(q_prime(i)) < epsilon) {
+            continue;
+        }
+
+        for (size_t j = i + 1; j < q_prime.size(); ++j) {
+            if (std::abs(q_prime(j)) < epsilon) {
+                continue;
+            }
+
+            const double curvature_ratio_i = q_double_prime(i) / q_prime(i);
+            const double curvature_ratio_j = q_double_prime(j) / q_prime(j);
+            const double curvature_difference = std::abs(curvature_ratio_i - curvature_ratio_j);
+
+            if (curvature_difference < epsilon) {
+                continue;
+            }
+
+            const double accel_sum = (q_ddot_max(i) / std::abs(q_prime(i))) + (q_ddot_max(j) / std::abs(q_prime(j)));
+            const double limit = std::sqrt(accel_sum / curvature_difference);
+
+            if (limit < min_limit) {
+                min_limit = limit;
+                limiting_i = i;
+                limiting_j = j;
+            }
+        }
+    }
+
+    // If no pairwise constraint was limiting, the derivative is undefined or zero
+    // (this would mean we're at an extremum case where q'_i = 0)
+    if (min_limit == std::numeric_limits<double>::infinity()) {
+        return 0.0;
+    }
+
+    // Now compute the derivative for the limiting constraint pair (i, j)
+    const size_t i = limiting_i;
+    const size_t j = limiting_j;
+
+    // Compute N(s) = q_ddot_max_i/|q'_i| + q_ddot_max_j/|q'_j|
+    const double N = (q_ddot_max(i) / std::abs(q_prime(i))) + (q_ddot_max(j) / std::abs(q_prime(j)));
+
+    // Compute D(s) = |q''_i/q'_i - q''_j/q'_j|
+    const double curvature_ratio_i = q_double_prime(i) / q_prime(i);
+    const double curvature_ratio_j = q_double_prime(j) / q_prime(j);
+    const double g = curvature_ratio_i - curvature_ratio_j;
+    const double D = std::abs(g);
+
+    if (D < epsilon) {
+        // Degenerate case: curvature ratios are equal, derivative undefined
+        return 0.0;
+    }
+
+    // Compute N'(s) = -q_ddot_max_i*q''_i/(|q'_i|*q'_i) - q_ddot_max_j*q''_j/(|q'_j|*q'_j)
+    // Using the identity |q'|*sgn(q') = q', this simplifies to:
+    const double N_prime = -(q_ddot_max(i) * q_double_prime(i)) / (std::abs(q_prime(i)) * q_prime(i))
+                          - (q_ddot_max(j) * q_double_prime(j)) / (std::abs(q_prime(j)) * q_prime(j));
+
+    // Compute g'(s) = (q'''_i*q'_i - (q''_i)^2)/(q'_i)^2 - (q'''_j*q'_j - (q''_j)^2)/(q'_j)^2
+    const double g_prime_i = (q_triple_prime(i) * q_prime(i) - q_double_prime(i) * q_double_prime(i))
+                            / (q_prime(i) * q_prime(i));
+    const double g_prime_j = (q_triple_prime(j) * q_prime(j) - q_double_prime(j) * q_double_prime(j))
+                            / (q_prime(j) * q_prime(j));
+    const double g_prime = g_prime_i - g_prime_j;
+
+    // Compute D'(s) = sgn(g) * g'(s)
+    const double D_prime = std::copysign(1.0, g) * g_prime;
+
+    // Compute the derivative: d/ds s_dot_max_acc = (N'*D - N*D') / (2*D^(3/2) * sqrt(N))
+    const double numerator = N_prime * D - N * D_prime;
+    const double denominator = 2.0 * std::pow(D, 1.5) * std::sqrt(N);
+
+    if (std::abs(denominator) < epsilon) {
+        // Numerically singular case
+        throw std::runtime_error{
+            "compute_acceleration_limit_derivative: denominator near zero - "
+            "acceleration limit curve derivative is numerically undefined"};
     }
 
     return numerator / denominator;
@@ -348,13 +491,11 @@ enum class integration_event : std::uint8_t {
                             compute_velocity_limits(q_prime, q_double_prime, opt.max_velocity, opt.max_acceleration, opt.epsilon);
 
                         // Validate: acceleration limit curve must have local minimum (derivative changes negative to positive)
-                        // Sample slightly before and after the extremum, clamped to segment bounds
-                        //
-                        // TODO: Replace numerical derivative check with analytical derivative computation.
-                        // For circular segments, we can derive the exact formula for d/ds s_dot_max_acc(s) from
-                        // equations 29-31 in the paper. The current epsilon-offset approach works but is less
-                        // accurate and has epsilon dependency. An analytical solution would be more robust and
-                        // faster (no need for 4 extra geometry queries + limit calculations per extremum).
+                        // Use analytical derivative computation instead of numerical approximation.
+                        // For circular segments, we compute the exact formula for d/ds s_dot_max_acc(s) from
+                        // the derivation in derivative_of_eq_31_totg.pdf.
+
+                        // Sample slightly before and after the extremum to check derivative sign change
                         const arc_length before_extremum = std::max(*first_extremum - arc_length{opt.epsilon}, current_segment.start());
                         const arc_length after_extremum = std::min(*first_extremum + arc_length{opt.epsilon}, current_segment.end());
 
@@ -365,18 +506,21 @@ enum class integration_event : std::uint8_t {
                         if (too_close_to_start || too_close_to_end) {
                             first_extremum.reset();
                         } else {
+                            // Compute analytical derivative before and after the extremum
                             const auto q_prime_before = current_segment.tangent(before_extremum);
                             const auto q_double_prime_before = current_segment.curvature(before_extremum);
-                            const auto [s_dot_before, _1] = compute_velocity_limits(
-                                q_prime_before, q_double_prime_before, opt.max_velocity, opt.max_acceleration, opt.epsilon);
+                            const double deriv_before = compute_acceleration_limit_derivative(
+                                current_segment, before_extremum, q_prime_before, q_double_prime_before,
+                                opt.max_acceleration, opt.epsilon);
 
                             const auto q_prime_after = current_segment.tangent(after_extremum);
                             const auto q_double_prime_after = current_segment.curvature(after_extremum);
-                            const auto [s_dot_after, _2] = compute_velocity_limits(
-                                q_prime_after, q_double_prime_after, opt.max_velocity, opt.max_acceleration, opt.epsilon);
+                            const double deriv_after = compute_acceleration_limit_derivative(
+                                current_segment, after_extremum, q_prime_after, q_double_prime_after,
+                                opt.max_acceleration, opt.epsilon);
 
-                            // Check if curve has local minimum (decreasing before, increasing after)
-                            const bool is_local_minimum = (s_dot_before > s_dot_max_acc) && (s_dot_after > s_dot_max_acc);
+                            // Check if curve has local minimum (derivative changes from negative to positive)
+                            const bool is_local_minimum = (deriv_before < -opt.epsilon) && (deriv_after > opt.epsilon);
 
                             if (is_local_minimum) {
                                 // Valid continuous-nondifferentiable switching point (Section VII-A case 2).
@@ -428,32 +572,28 @@ enum class integration_event : std::uint8_t {
         const auto [s_dot_max_acc_after, _2] =
             compute_velocity_limits(q_prime_after, q_double_prime_after, opt.max_velocity, opt.max_acceleration, opt.epsilon);
 
-        // Compute limit curve slopes using numerical approximation
-        // TODO(RSDK-12850): Investigate computing numerical derivatives versus epsilon
-        // TODO(RSDK-12851): Decide if it is safe to move onto the next switching point
-        const arc_length before_boundary = std::max(boundary - arc_length{opt.epsilon}, current_segment.start());
-        const double actual_step_left = static_cast<double>(boundary - before_boundary);
-        if (actual_step_left < opt.epsilon * 0.5) {
+        // Compute limit curve slopes using analytical derivative
+        // This is d/ds s_dot_max_acc(s-) evaluated just before the boundary
+        const arc_length just_before_boundary = std::max(boundary - arc_length{opt.epsilon}, current_segment.start());
+        if ((boundary - just_before_boundary) < arc_length{opt.epsilon * 0.5}) {
             continue;
         }
-        const auto q_prime_bb = current_segment.tangent(before_boundary);
-        const auto q_double_prime_bb = current_segment.curvature(before_boundary);
-        const auto [s_dot_max_acc_bb, _5] =
-            compute_velocity_limits(q_prime_bb, q_double_prime_bb, opt.max_velocity, opt.max_acceleration, opt.epsilon);
-        // This is d/ds s_dot_max_acc(s-)
-        const double slope_left = (s_dot_max_acc_before - s_dot_max_acc_bb) / actual_step_left;
+        const auto q_prime_left = current_segment.tangent(just_before_boundary);
+        const auto q_double_prime_left = current_segment.curvature(just_before_boundary);
+        const double slope_left = compute_acceleration_limit_derivative(
+            current_segment, just_before_boundary, q_prime_left, q_double_prime_left,
+            opt.max_acceleration, opt.epsilon);
 
-        const arc_length after_boundary = std::min(boundary + arc_length{opt.epsilon}, segment_after.end());
-        const double actual_step_right = static_cast<double>(after_boundary - boundary);
-        if (actual_step_right < opt.epsilon * 0.5) {
+        // This is d/ds s_dot_max_acc(s+) evaluated just after the boundary
+        const arc_length just_after_boundary = std::min(boundary + arc_length{opt.epsilon}, segment_after.end());
+        if ((just_after_boundary - boundary) < arc_length{opt.epsilon * 0.5}) {
             continue;
         }
-        const auto q_prime_ab = segment_after.tangent(after_boundary);
-        const auto q_double_prime_ab = segment_after.curvature(after_boundary);
-        const auto [s_dot_max_acc_ab, _6] =
-            compute_velocity_limits(q_prime_ab, q_double_prime_ab, opt.max_velocity, opt.max_acceleration, opt.epsilon);
-        // This is d/ds s_dot_max_acc(s+)
-        const double slope_right = (s_dot_max_acc_ab - s_dot_max_acc_after) / actual_step_right;
+        const auto q_prime_right = segment_after.tangent(just_after_boundary);
+        const auto q_double_prime_right = segment_after.curvature(just_after_boundary);
+        const double slope_right = compute_acceleration_limit_derivative(
+            segment_after, just_after_boundary, q_prime_right, q_double_prime_right,
+            opt.max_acceleration, opt.epsilon);
 
         // Apply Equation 38
         // A discontinuity of s_dot_max_acc(s) is a switching point if and only if:
