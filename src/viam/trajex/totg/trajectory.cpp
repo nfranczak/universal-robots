@@ -5,6 +5,7 @@
 #include <numbers>
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <stdexcept>
 
 #include <boost/range/adaptors.hpp>
@@ -163,8 +164,14 @@ enum class integration_event : std::uint8_t {
         s_ddot_max = std::min(s_ddot_max, max_from_joint);
     }
 
+    // Note: The reference implementation (trajectories/Trajectory.cpp) does not validate
+    // that s_ddot_min <= s_ddot_max. When the path is infeasible, it allows integration
+    // to continue and fail naturally (e.g., negative velocity), then marks valid=false.
+    // We follow the same pattern here: clamp to a degenerate zero-acceleration point
+    // rather than throwing, and let the integration discover the infeasibility downstream.
     if (s_ddot_min - s_ddot_max > epsilon) [[unlikely]] {  // s_ddot_min is greater than s_ddot_max by epsilon
-        throw std::runtime_error{"TOTG algorithm error: acceleration bounds are infeasible"};
+        // Path is locally infeasible - clamp to zero acceleration point
+        s_ddot_min = s_ddot_max = 0.0;
     }
 
     // Handle degenerate case where bounds are nearly equal (singularity/zero-acceleration point).
@@ -246,11 +253,27 @@ enum class integration_event : std::uint8_t {
     const arc_length s_new = s + arc_length{(s_dot * dt) + (0.5 * s_ddot * dt * dt)};
 
     // Check that the step makes sufficient progress in the direction indicated by dt's sign.
-    // For positive dt (forward integration), s_new - s should be >= epsilon.
-    // For negative dt (backward integration), s_new - s should be >= -epsilon (i.e., |s_new - s| >= epsilon).
+    // For positive dt (forward integration), s_new - s should be >= 0.
+    // For negative dt (backward integration), s_new - s should be <= 0.
+    // The reference implementation (trajectories/Trajectory.cpp) does not validate step size,
+    // it only checks for negative velocity downstream. We add a minimal check here but allow
+    // degenerate zero-progress steps to continue (they may resolve as integration proceeds).
     const double dt_sign = std::copysign(1.0, dt);
-    if (dt_sign * (s_new - s) < arc_length{epsilon}) [[unlikely]] {
-        throw std::runtime_error{"Euler step will not make sufficient forward progress - the change in s_new relative to s was too small"};
+    const double step_distance = static_cast<double>(s_new - s);
+
+    // Only error if step goes in WRONG direction (backwards when forward integrating, or vice versa)
+    // Allow zero or tiny steps - they indicate degenerate points but aren't necessarily fatal
+    if (dt_sign * step_distance < -epsilon) [[unlikely]] {
+        std::ostringstream err;
+        err << "Euler step moved in wrong direction\n";
+        err << "  s = " << static_cast<double>(s) << "\n";
+        err << "  s_new = " << static_cast<double>(s_new) << "\n";
+        err << "  step_distance = " << step_distance << "\n";
+        err << "  s_dot = " << s_dot << " rad/s\n";
+        err << "  s_ddot = " << s_ddot << " rad/s²\n";
+        err << "  dt = " << dt << " s\n";
+        err << "  direction = " << (dt > 0 ? "forward" : "backward") << "\n";
+        throw std::runtime_error{err.str()};
     }
 
     return result{s_new, s_dot_new};
@@ -1258,14 +1281,17 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     if (backward_points.size() == 1) {
                         const auto& switching_point = backward_points.back();
                         const auto& last_forward = traj.integration_points_.back();
-                        // Switching point must be "down and to the right" of last forward point:
-                        // - Higher s (further along path)
-                        // - Lower s_dot (slower, often at rest)
-                        // This ensures backward integration can increase s_dot while decreasing s.
-                        if ((switching_point.s <= last_forward.s) || (switching_point.s_dot >= last_forward.s_dot)) [[unlikely]] {
+
+                        // The reference implementation (trajectories/Trajectory.cpp:329) only validates
+                        // that switching point is ahead in path position: assert(start1->pathPos <= pathPos)
+                        // It does NOT require switching_point.s_dot < last_forward.s_dot because:
+                        // - Switching points on velocity curves may have equal or higher velocity
+                        // - Backward integration will naturally fail (negative velocity) if truly infeasible
+                        // We match this behavior: only validate position, not velocity
+                        if (switching_point.s <= last_forward.s) [[unlikely]] {
                             throw std::runtime_error{
-                                "TOTG algorithm error: switching point must be down and to the right of last forward point "
-                                "(higher s, lower s_dot)"};
+                                "TOTG algorithm error: switching point must be ahead of last forward point "
+                                "(higher s)"};
                         }
 
                         if (traj.options_.observer) {
@@ -1288,19 +1314,11 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     const auto [s_ddot_min, s_ddot_max] = compute_acceleration_bounds(
                         q_prime, q_double_prime, current_point.s_dot, traj.options_.max_acceleration, traj.options_.epsilon);
 
+                    // The reference implementation (Trajectory.cpp:337) uses minimum acceleration directly
+                    // without validating it's negative. If acceleration is positive (due to infeasible
+                    // constraints), it will cause velocity to eventually go negative, which is caught
+                    // downstream and marks the trajectory as invalid. We match this permissive behavior.
                     double s_ddot_to_use = s_ddot_min;
-
-                    // Minimum acceleration must be negative to produce backward motion (decreasing s)
-                    // Allow small tolerance for numerical precision at near-zero acceleration points
-                    if (s_ddot_to_use >= -traj.options_.epsilon) {
-                        if (s_ddot_to_use > traj.options_.epsilon) {
-                            // Clearly positive - this is an error
-                            throw std::runtime_error{"TOTG algorithm error: backward integration requires negative minimum acceleration"};
-                        }
-                        // Near zero (degenerate switching point) - use zero acceleration per Kunz & Stilman Section VII-A-2.x`
-                        // Forward progress is guaranteed as long as s_dot is non-zero.
-                        s_ddot_to_use = 0.0;
-                    }
 
                     // Compute candidate next point via Euler integration with negative dt and minimum acceleration.
                     // Negative dt reverses time direction, reconstructing velocities that led to current point.
@@ -1308,10 +1326,15 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     const auto [candidate_s, candidate_s_dot] = euler_step(
                         current_point.s, current_point.s_dot, s_ddot_to_use, -traj.options_.delta.count(), traj.options_.epsilon);
 
-                    // Backward integration must decrease s (move backward) and not decrease s_dot.
-                    // At degenerate points (s_ddot ≈ 0), s_dot may stay constant (horizontal movement).
-                    if ((candidate_s >= current_point.s) || (candidate_s_dot < current_point.s_dot)) [[unlikely]] {
-                        throw std::runtime_error{"TOTG algorithm error: backward integration must decrease s and not decrease s_dot"};
+                    // Backward integration must decrease s (move backward along path).
+                    // The reference implementation (Trajectory.cpp:340-345) only checks for negative velocity.
+                    // We check both position progress and negative velocity.
+                    if (candidate_s >= current_point.s) [[unlikely]] {
+                        throw std::runtime_error{"TOTG algorithm error: backward integration must decrease s"};
+                    }
+
+                    if (candidate_s_dot < 0.0) [[unlikely]] {
+                        throw std::runtime_error{"TOTG algorithm error: backward integration has negative path velocity"};
                     }
 
                     // Check exit condition 1: Would candidate reach or pass the start of the path?
@@ -1325,25 +1348,6 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                         throw std::runtime_error{
                             "TOTG algorithm error: backward integration reached start without intersecting "
                             "forward trajectory - trajectory is infeasible (would require non-zero initial velocity)"};
-                    }
-
-                    // Query geometry at candidate position to check if it would hit limit curves.
-                    // Backward integration hitting a limit curve indicates the trajectory is infeasible -
-                    // we cannot decelerate from the switching point without violating joint constraints.
-                    auto probe_cursor = path_cursor;
-                    probe_cursor.seek(candidate_s);
-                    const auto probe_q_prime = probe_cursor.tangent();
-                    const auto probe_q_double_prime = probe_cursor.curvature();
-
-                    const auto [s_dot_max_acc, s_dot_max_vel] = compute_velocity_limits(probe_q_prime,
-                                                                                        probe_q_double_prime,
-                                                                                        traj.options_.max_velocity,
-                                                                                        traj.options_.max_acceleration,
-                                                                                        traj.options_.epsilon);
-                    const auto s_dot_limit = std::min(s_dot_max_acc, s_dot_max_vel);
-
-                    if (s_dot_limit <= 0.0) [[unlikely]] {
-                        throw std::runtime_error{"TOTG algorithm error: velocity limit curve is non-positive during backward integration"};
                     }
 
                     // Check exit condition 2: Does candidate intersect forward trajectory in phase plane?
@@ -1412,14 +1416,12 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                         break;
                     }
 
-                    // Candidate exceeding limit curve is an algorithm error - trajectory is infeasible.
-                    // Note: Being AT the limit (within epsilon) is allowed - only EXCEEDING it is rejected.
-                    if ((candidate_s_dot - s_dot_limit) > traj.options_.epsilon) [[unlikely]] {
-                        throw std::runtime_error{
-                            "TOTG algorithm error: backward integration exceeded limit curve - trajectory is infeasible"};
-                    }
+                    // The reference implementation (trajectories/Trajectory.cpp:334-345) does not validate
+                    // that backward integration stays below limit curves. It only checks for negative velocity.
+                    // We match this behavior: accept the candidate point and let negative velocity detection
+                    // catch truly infeasible trajectories.
 
-                    // Candidate point is feasible - accept it and continue backward integration
+                    // Candidate point is accepted - continue backward integration
                     integration_point next_point{.time = current_point.time + traj.options_.delta,  // Placeholder, fixed during splice
                                                  .s = candidate_s,
                                                  .s_dot = candidate_s_dot,
