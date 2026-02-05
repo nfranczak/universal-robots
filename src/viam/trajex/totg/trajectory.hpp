@@ -1,6 +1,8 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
+#include <optional>
 
 #if __has_include(<xtensor/containers/xarray.hpp>)
 #include <xtensor/containers/xarray.hpp>
@@ -66,6 +68,30 @@ class trajectory {
     class integration_event_observer;
 
     ///
+    /// TCP (tool center point) velocity limit.
+    ///
+    /// Constrains the Cartesian linear velocity of the tool center point.
+    /// The Jacobian maps joint velocities to TCP linear velocity, and the
+    /// constraint is folded into the velocity limit curve transparently.
+    ///
+    struct tcp_limit {
+        ///
+        /// Maximum TCP linear velocity in m/s. Must be positive.
+        ///
+        double max_velocity;
+
+        ///
+        /// Returns the 3xN linear velocity Jacobian as an xtensor array.
+        ///
+        /// The Jacobian maps joint velocities to TCP linear velocity:
+        ///   v_TCP = J(q) * q_dot
+        /// where J is 3xN (3 Cartesian linear velocity components, N joints).
+        /// The caller is responsible for bridging from Eigen or other representations.
+        ///
+        std::function<xt::xarray<double>(const xt::xarray<double>&)> jacobian;
+    };
+
+    ///
     /// Options for trajectory generation via TOTG algorithm.
     ///
     struct options {
@@ -102,6 +128,14 @@ class trajectory {
         /// Numerical comparison epsilon.
         ///
         class epsilon epsilon{k_default_epsilon};
+
+        ///
+        /// Optional TCP (tool center point) velocity limit.
+        ///
+        /// When set, adds a TCP velocity constraint that is folded into the
+        /// velocity limit curve: s_dot_max_vel(s) = min(joint, TCP).
+        ///
+        std::optional<struct tcp_limit> tcp{};
 
         ///
         /// Observer for integration events (optional).

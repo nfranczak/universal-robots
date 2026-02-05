@@ -166,6 +166,9 @@ find_package(Boost CONFIG REQUIRED
 
 enable_testing()
 
+# Jacobian library (submodule)
+add_subdirectory(third_party/jacobian)
+
 #
 # Declare targets
 #
@@ -206,6 +209,7 @@ target_sources(trajex
     src/viam/trajex/totg/json_serialization.cpp
     src/viam/trajex/totg/observers.cpp
     src/viam/trajex/totg/path.cpp
+    src/viam/trajex/totg/phase_plane_csv.cpp
     src/viam/trajex/totg/trajectory.cpp
     src/viam/trajex/totg/uniform_sampler.cpp
     src/viam/trajex/totg/waypoint_accumulator.cpp
@@ -302,6 +306,8 @@ target_link_libraries(viam-ur
     viam-cpp-sdk::viamapi # Proxy for gRPC
     viam-cpp-sdk::viamsdk
     jsoncpp_lib
+  PRIVATE
+    jacobian
 )
 
 apply_wall_werror(viam-ur)
@@ -367,11 +373,13 @@ target_sources(trajex-test
     src/viam/trajex/totg/test/uniform_sampler.cpp
     src/viam/trajex/totg/test/integration.cpp
     src/viam/trajex/totg/test/observers.cpp
+    src/viam/trajex/totg/test/tcp_velocity_limit.cpp
 )
 
 target_link_libraries(trajex-test
   PRIVATE
     trajex
+    jacobian
     Boost::boost
     trajectories
     jsoncpp_lib

@@ -47,6 +47,9 @@
 #include <viam/trajex/totg/uniform_sampler.hpp>
 #include <viam/trajex/types/hertz.hpp>
 
+#include <jacobian.hpp>
+#include <urdf_parser.hpp>
+
 #include "ur_arm_state.hpp"
 #include "utils.hpp"
 
@@ -969,6 +972,44 @@ void URArm::move_joint_space_(std::shared_lock<std::shared_mutex> config_rlock,
             trajex_opts.max_acceleration = xt::xarray<double>::from_shape({acceleration_limits_data.size()});
             std::ranges::copy(velocity_limits_data, trajex_opts.max_velocity.begin());
             std::ranges::copy(acceleration_limits_data, trajex_opts.max_acceleration.begin());
+
+            // Set up TCP velocity limit using the Jacobian library
+            const auto urdf_path = [&]() -> std::optional<std::filesystem::path> {
+                const auto kinematics_dir = current_state_->resource_root() / "kinematics";
+                if (model_ == model("ur5e") || model_ == model("ur7e")) {
+                    return kinematics_dir / "ur5e.urdf";
+                } else if (model_ == model("ur20")) {
+                    return kinematics_dir / "ur20.urdf";
+                }
+                return std::nullopt;
+            }();
+
+            if (urdf_path) {
+                auto jac_model = std::make_shared<jacobian::Model>(
+                    jacobian::parseURDF(urdf_path->string()));
+
+                trajex_opts.tcp = totg::trajectory::tcp_limit{
+                    .max_velocity = 1.0,
+                    .jacobian = [jac_model](const xt::xarray<double>& q) -> xt::xarray<double> {
+                        std::array<double, 6> joint_angles{};
+                        for (std::size_t i = 0; i < 6; ++i) {
+                            joint_angles[i] = q(i);
+                        }
+                        jacobian::Data data;
+                        jacobian::computeJacobian(*jac_model, joint_angles, data);
+
+                        xt::xarray<double> result = xt::zeros<double>({3u, 6u});
+                        for (std::size_t r = 0; r < 3; ++r) {
+                            for (std::size_t c = 0; c < 6; ++c) {
+                                result(r, c) = data.Jv(
+                                    static_cast<Eigen::Index>(r),
+                                    static_cast<Eigen::Index>(c));
+                            }
+                        }
+                        return result;
+                    },
+                };
+            }
 
             std::vector<trajectory_sample_point> all_trajex_samples;
 
