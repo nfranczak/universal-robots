@@ -268,9 +268,10 @@ trajectory::velocity_limits compute_velocity_limits_with_tcp(const xt::xarray<do
 
 // Computes derivative of the combined velocity limit curve (joint + TCP).
 // When TCP is not enabled, delegates to the existing analytical joint derivative.
-// When TCP is the active constraint, uses numerical central finite differences.
-// Takes q_prime/q_double_prime explicitly so boundary-side-specific geometry works
-// correctly at segment boundaries.
+// When TCP is the active constraint, uses one-sided numerical finite differences
+// anchored at the TCP limit evaluated with the caller's side-specific tangent.
+// At segment boundaries, selects the neighbor whose tangent is geometrically
+// consistent with the passed-in q_prime, avoiding straddling the discontinuity.
 auto compute_velocity_limit_derivative_with_tcp(const xt::xarray<double>& q_prime,
                                                  const xt::xarray<double>& q_double_prime,
                                                  path::cursor cursor,
@@ -301,37 +302,77 @@ auto compute_velocity_limit_derivative_with_tcp(const xt::xarray<double>& q_prim
         return compute_velocity_limit_derivative(q_prime, q_double_prime, opt.max_velocity, opt.epsilon);
     }
 
-    // TCP is the active constraint (or equal) - use numerical central finite differences
+    // TCP is the active constraint (or equal) — use numerical finite differences.
+    // tcp_vel_limit is the TCP limit at s, evaluated with the caller's side-specific
+    // tangent. At segment boundaries q_prime differs on each side; using it as the
+    // anchor ensures the derivative is consistent with the side being evaluated.
+    const auto tcp_s = tcp_vel_limit;
+
     const double h = 100.0 * static_cast<double>(opt.epsilon);
     const auto s = cursor.position();
     const auto path_length = cursor.path().length();
 
     const auto s_minus = std::max(s - arc_length{h}, arc_length{0.0});
     const auto s_plus = std::min(s + arc_length{h}, path_length);
-    const auto actual_h = s_plus - s_minus;
+    const auto h_back = s - s_minus;
+    const auto h_fwd = s_plus - s;
 
-    // If step is too small, fall back to analytical joint derivative
-    if (actual_h < opt.epsilon) {
+    const bool have_back = h_back > opt.epsilon;
+    const bool have_fwd = h_fwd > opt.epsilon;
+
+    if (!have_back && !have_fwd) {
         return compute_velocity_limit_derivative(q_prime, q_double_prime, opt.max_velocity, opt.epsilon);
     }
 
-    // Evaluate the TCP velocity limit alone at s-h and s+h. We already know TCP is the active
-    // constraint at s. Using the combined min(joint, TCP) here would give a meaningless average
-    // if the active constraint switches within the finite difference window (the combined curve
-    // has a kink at crossover points, and central differences across a kink don't approximate
-    // either curve's derivative).
-    cursor.seek(s_minus);
-    const auto q_prime_minus = cursor.tangent();
-    const auto q_minus = cursor.configuration();
-    const auto tcp_minus = compute_tcp_velocity_limit(q_minus, q_prime_minus, *opt.tcp, opt.epsilon);
+    // Compute one-sided differences anchored at tcp_s. Each neighbor is evaluated
+    // using the cursor's geometry at that point. We also measure how much the
+    // neighbor's tangent differs from the passed-in q_prime — at segment boundaries
+    // one side will have a discontinuous tangent and the other will be consistent.
+    double d_back = 0.0;
+    double tangent_dist_sq_back = std::numeric_limits<double>::infinity();
+    if (have_back) {
+        cursor.seek(s_minus);
+        const auto q_prime_back = cursor.tangent();
+        const auto tcp_back = compute_tcp_velocity_limit(
+            cursor.configuration(), q_prime_back, *opt.tcp, opt.epsilon);
+        d_back = static_cast<double>(tcp_s - tcp_back) / static_cast<double>(h_back);
 
-    cursor.seek(s_plus);
-    const auto q_prime_plus = cursor.tangent();
-    const auto q_plus = cursor.configuration();
-    const auto tcp_plus = compute_tcp_velocity_limit(q_plus, q_prime_plus, *opt.tcp, opt.epsilon);
+        tangent_dist_sq_back = 0.0;
+        for (size_t i = 0; i < q_prime.size(); ++i) {
+            const auto diff = q_prime(i) - q_prime_back(i);
+            tangent_dist_sq_back += diff * diff;
+        }
+    }
 
-    // Central difference of the TCP velocity limit curve
-    const double derivative = static_cast<double>(tcp_plus - tcp_minus) / static_cast<double>(actual_h);
+    double d_fwd = 0.0;
+    double tangent_dist_sq_fwd = std::numeric_limits<double>::infinity();
+    if (have_fwd) {
+        cursor.seek(s_plus);
+        const auto q_prime_fwd = cursor.tangent();
+        const auto tcp_fwd = compute_tcp_velocity_limit(
+            cursor.configuration(), q_prime_fwd, *opt.tcp, opt.epsilon);
+        d_fwd = static_cast<double>(tcp_fwd - tcp_s) / static_cast<double>(h_fwd);
+
+        tangent_dist_sq_fwd = 0.0;
+        for (size_t i = 0; i < q_prime.size(); ++i) {
+            const auto diff = q_prime(i) - q_prime_fwd(i);
+            tangent_dist_sq_fwd += diff * diff;
+        }
+    }
+
+    // Select the one-sided difference whose neighbor's tangent is most consistent
+    // with the passed-in q_prime. At segment boundaries the tangent is discontinuous,
+    // so only one side has consistent geometry. At interior points both sides are
+    // equally consistent and either gives a valid O(h) approximation.
+    double derivative;
+    if (have_back && have_fwd) {
+        derivative = (tangent_dist_sq_back <= tangent_dist_sq_fwd) ? d_back : d_fwd;
+    } else if (have_back) {
+        derivative = d_back;
+    } else {
+        derivative = d_fwd;
+    }
+
     return phase_plane_slope{derivative};
 }
 
