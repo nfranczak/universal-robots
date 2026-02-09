@@ -209,7 +209,6 @@ target_sources(trajex
     src/viam/trajex/totg/json_serialization.cpp
     src/viam/trajex/totg/observers.cpp
     src/viam/trajex/totg/path.cpp
-    src/viam/trajex/totg/phase_plane_csv.cpp
     src/viam/trajex/totg/trajectory.cpp
     src/viam/trajex/totg/uniform_sampler.cpp
     src/viam/trajex/totg/waypoint_accumulator.cpp

@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -30,6 +31,8 @@
 #include <jacobian.hpp>
 #include <urdf_parser.hpp>
 
+#include <viam/trajex/totg/json_serialization.hpp>
+#include <viam/trajex/totg/observers.hpp>
 #include <viam/trajex/totg/path.hpp>
 #include <viam/trajex/totg/trajectory.hpp>
 
@@ -51,6 +54,15 @@ auto zero_jacobian = [](const xt::xarray<double>&) -> xt::xarray<double> {
 trajectory::tcp_limit make_tcp(double max_vel,
                                std::function<xt::xarray<double>(const xt::xarray<double>&)> jac) {
     return {.max_velocity = max_vel, .jacobian = std::move(jac)};
+}
+
+void write_phase_plane_json(const std::string& filename,
+                            const trajectory& traj,
+                            const trajectory_integration_event_collector& collector) {
+    std::ofstream out(filename);
+    write_trajectory_json(out, traj, collector);
+    out.close();
+    BOOST_TEST_MESSAGE("Wrote phase plane JSON to " << filename);
 }
 
 }  // namespace
@@ -95,19 +107,25 @@ BOOST_AUTO_TEST_CASE(large_tcp_limit_matches_no_tcp) {
     const auto p = path::create(waypoints);
 
     // Baseline: no TCP limit
+    trajectory_integration_event_collector baseline_collector;
     trajectory::options baseline_opts{
         .max_velocity = xt::xarray<double>{1.0, 1.0, 1.0},
         .max_acceleration = xt::xarray<double>{1.5, 1.5, 1.5},
     };
+    baseline_opts.observer = &baseline_collector;
     const auto baseline = trajectory::create(p, baseline_opts);
+    write_phase_plane_json("large_tcp_limit_baseline.json", baseline, baseline_collector);
 
     // With TCP limit much larger than any joint can produce
+    trajectory_integration_event_collector tcp_collector;
     trajectory::options tcp_opts{
         .max_velocity = xt::xarray<double>{1.0, 1.0, 1.0},
         .max_acceleration = xt::xarray<double>{1.5, 1.5, 1.5},
         .tcp = make_tcp(1000.0, identity_jacobian),
     };
+    tcp_opts.observer = &tcp_collector;
     const auto with_tcp = trajectory::create(p, tcp_opts);
+    write_phase_plane_json("large_tcp_limit_with_tcp.json", with_tcp, tcp_collector);
 
     // Durations should be identical (within floating point tolerance)
     BOOST_CHECK_CLOSE(baseline.duration().count(), with_tcp.duration().count(), 0.1);
@@ -120,19 +138,25 @@ BOOST_AUTO_TEST_CASE(small_tcp_limit_increases_duration) {
     const auto p = path::create(waypoints);
 
     // Baseline: no TCP limit
+    trajectory_integration_event_collector baseline_collector;
     trajectory::options baseline_opts{
         .max_velocity = xt::xarray<double>{2.0, 2.0, 2.0},
         .max_acceleration = xt::xarray<double>{2.0, 2.0, 2.0},
     };
+    baseline_opts.observer = &baseline_collector;
     const auto baseline = trajectory::create(p, baseline_opts);
+    write_phase_plane_json("small_tcp_limit_baseline.json", baseline, baseline_collector);
 
     // With restrictive TCP limit (0.1 m/s is much slower than joint limits)
+    trajectory_integration_event_collector tcp_collector;
     trajectory::options tcp_opts{
         .max_velocity = xt::xarray<double>{2.0, 2.0, 2.0},
         .max_acceleration = xt::xarray<double>{2.0, 2.0, 2.0},
         .tcp = make_tcp(0.1, identity_jacobian),
     };
+    tcp_opts.observer = &tcp_collector;
     const auto with_tcp = trajectory::create(p, tcp_opts);
+    write_phase_plane_json("small_tcp_limit_with_tcp.json", with_tcp, tcp_collector);
 
     // TCP-constrained trajectory should be slower
     BOOST_CHECK_GT(with_tcp.duration().count(), baseline.duration().count());
@@ -145,19 +169,25 @@ BOOST_AUTO_TEST_CASE(zero_jacobian_is_non_constraining) {
     const auto p = path::create(waypoints);
 
     // Baseline: no TCP limit
+    trajectory_integration_event_collector baseline_collector;
     trajectory::options baseline_opts{
         .max_velocity = xt::xarray<double>{1.0, 1.0, 1.0},
         .max_acceleration = xt::xarray<double>{1.5, 1.5, 1.5},
     };
+    baseline_opts.observer = &baseline_collector;
     const auto baseline = trajectory::create(p, baseline_opts);
+    write_phase_plane_json("zero_jacobian_baseline.json", baseline, baseline_collector);
 
     // With zero Jacobian: TCP velocity is always zero, so limit is infinity
+    trajectory_integration_event_collector tcp_collector;
     trajectory::options tcp_opts{
         .max_velocity = xt::xarray<double>{1.0, 1.0, 1.0},
         .max_acceleration = xt::xarray<double>{1.5, 1.5, 1.5},
         .tcp = make_tcp(0.5, zero_jacobian),
     };
+    tcp_opts.observer = &tcp_collector;
     const auto with_tcp = trajectory::create(p, tcp_opts);
+    write_phase_plane_json("zero_jacobian_with_tcp.json", with_tcp, tcp_collector);
 
     // Duration should be identical since TCP constraint is non-constraining
     BOOST_CHECK_CLOSE(baseline.duration().count(), with_tcp.duration().count(), 0.1);
@@ -173,19 +203,25 @@ BOOST_AUTO_TEST_CASE(straight_line_with_identity_jacobian) {
     // With identity Jacobian, the TCP velocity along a straight line in joint 0
     // equals the joint 0 velocity. Setting TCP limit = 0.5 should be equivalent
     // to setting joint 0 max velocity to 0.5 (since tangent is [1,0,0]).
+    trajectory_integration_event_collector tcp_collector;
     trajectory::options tcp_opts{
         .max_velocity = xt::xarray<double>{2.0, 2.0, 2.0},
         .max_acceleration = xt::xarray<double>{2.0, 2.0, 2.0},
         .tcp = make_tcp(0.5, identity_jacobian),
     };
+    tcp_opts.observer = &tcp_collector;
     const auto with_tcp = trajectory::create(p, tcp_opts);
+    write_phase_plane_json("straight_line_identity_jacobian_tcp.json", with_tcp, tcp_collector);
 
     // Compare with equivalent joint limit
+    trajectory_integration_event_collector joint_collector;
     trajectory::options joint_opts{
         .max_velocity = xt::xarray<double>{0.5, 2.0, 2.0},
         .max_acceleration = xt::xarray<double>{2.0, 2.0, 2.0},
     };
+    joint_opts.observer = &joint_collector;
     const auto with_joint = trajectory::create(p, joint_opts);
+    write_phase_plane_json("straight_line_identity_jacobian_joint.json", with_joint, joint_collector);
 
     // Durations should be very close since constraints are equivalent
     BOOST_CHECK_CLOSE(with_tcp.duration().count(), with_joint.duration().count(), 1.0);
@@ -256,15 +292,19 @@ BOOST_AUTO_TEST_CASE(ur20_spiral_phase_plane) {
     const xt::xarray<double> max_acc = {deg(150), deg(150), deg(150), deg(150), deg(150), deg(150)};
 
     // Baseline: no TCP limit
+    trajectory_integration_event_collector baseline_collector;
     trajectory::options baseline_opts{
         .max_velocity = max_vel,
         .max_acceleration = max_acc,
     };
+    baseline_opts.observer = &baseline_collector;
     const auto baseline = trajectory::create(p, baseline_opts);
+    write_phase_plane_json("ur20_spiral_baseline.json", baseline, baseline_collector);
     BOOST_TEST_MESSAGE("Baseline (no TCP) duration: " << baseline.duration().count() << "s");
     BOOST_CHECK_GT(baseline.duration().count(), 0.0);
 
     // With TCP velocity limit from UR20 Jacobian
+    trajectory_integration_event_collector tcp_collector;
     trajectory::options tcp_opts{
         .max_velocity = max_vel,
         .max_acceleration = max_acc,
@@ -273,8 +313,9 @@ BOOST_AUTO_TEST_CASE(ur20_spiral_phase_plane) {
             .jacobian = jac_fn,
         },
     };
-
+    tcp_opts.observer = &tcp_collector;
     const auto traj = trajectory::create(p, tcp_opts);
+    write_phase_plane_json("ur20_spiral_with_tcp.json", traj, tcp_collector);
 
     BOOST_CHECK_GT(traj.duration().count(), 0.0);
     BOOST_TEST_MESSAGE("TCP-constrained trajectory duration: " << traj.duration().count() << "s");
