@@ -31,7 +31,6 @@
 #include <urdf_parser.hpp>
 
 #include <viam/trajex/totg/path.hpp>
-#include <viam/trajex/totg/phase_plane_csv.hpp>
 #include <viam/trajex/totg/trajectory.hpp>
 
 namespace {
@@ -206,8 +205,8 @@ BOOST_AUTO_TEST_CASE(no_tcp_options_works_normally) {
 }
 
 // UR20 URDF spiral path: exercises the real Jacobian over a complex multi-waypoint
-// trajectory and exports phase plane CSVs for visualization.
-BOOST_AUTO_TEST_CASE(ur20_spiral_phase_plane_csv) {
+// trajectory with TCP velocity limits.
+BOOST_AUTO_TEST_CASE(ur20_spiral_phase_plane) {
     // Resolve the UR20 URDF relative to this source file
     const auto urdf_path =
         std::filesystem::path(__FILE__).parent_path() / "../../../../kinematics/ur20.urdf";
