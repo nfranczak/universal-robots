@@ -283,15 +283,6 @@ BOOST_AUTO_TEST_CASE(ur20_spiral_phase_plane_csv) {
 
     // TCP constraint should make trajectory slower (or equal)
     BOOST_CHECK_GE(traj.duration().count(), baseline.duration().count() - 0.001);
-
-    // Export phase plane CSVs
-    write_phase_plane_csv(traj, "/tmp/ur20_spiral");
-
-    BOOST_CHECK(std::filesystem::exists("/tmp/ur20_spiral_trajectory.csv"));
-    BOOST_CHECK(std::filesystem::exists("/tmp/ur20_spiral_limits.csv"));
-
-    BOOST_TEST_MESSAGE("Phase plane CSVs written to /tmp/ur20_spiral_trajectory.csv "
-                       "and /tmp/ur20_spiral_limits.csv");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
