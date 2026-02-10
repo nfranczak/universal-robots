@@ -1,5 +1,5 @@
 [submodule "trajectories"]
-	path = src/third_party/trajectories
+	path = src/viam/trajex/src/third_party/trajectories
 	url = https://github.com/tobiaskunz/trajectories.git
 [submodule "third_party/jacobian"]
 	path = third_party/jacobian
