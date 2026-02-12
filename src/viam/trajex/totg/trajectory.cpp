@@ -287,7 +287,8 @@ trajectory::velocity_limits compute_velocity_limits_with_tcp(const xt::xarray<do
 // Computes derivative of the combined velocity limit curve (joint + TCP).
 // When TCP is not enabled, delegates to the existing analytical joint derivative.
 // When TCP is the active constraint, uses one-sided numerical finite differences
-// anchored at the TCP limit evaluated with the caller's side-specific tangent.
+// anchored at the combined limit min(joint, TCP) evaluated with the caller's
+// side-specific tangent.
 // At segment boundaries, selects the neighbor whose tangent is geometrically
 // consistent with the passed-in q_prime, avoiding straddling the discontinuity.
 // At interior points, averages both one-sided differences for O(h²) accuracy.
@@ -319,20 +320,23 @@ auto compute_velocity_limit_derivative_with_tcp(const xt::xarray<double>& q_prim
     // Compute TCP velocity limit using the caller's side-specific tangent.
     const auto tcp_vel_limit = compute_tcp_velocity_limit(q, q_prime, *opt.tcp, opt.epsilon);
 
-    // [Fix #1/#2] When joint limit is tighter or epsilon-equal to TCP, use the
-    // analytical joint derivative. This avoids numerical finite differences at
-    // the crossover kink (where min(joint, TCP) is non-differentiable) and
-    // prevents the epsilon-wide band where TCP would win ties unnecessarily.
-    // The analytical derivative is more accurate and stable than numerical.
-    if (opt.epsilon.wrap(joint_vel_limit) <= opt.epsilon.wrap(tcp_vel_limit)) {
+    // Determine which branch of min(joint, TCP) is active. At epsilon-ties we
+    // intentionally treat the curve as potentially non-differentiable and use
+    // finite differences on the combined limit rather than forcing one branch.
+    const bool joint_strictly_active = opt.epsilon.wrap(joint_vel_limit) < opt.epsilon.wrap(tcp_vel_limit);
+
+    // When joint is strictly active, use the analytical joint derivative.
+    if (joint_strictly_active) {
         return safe_velocity_limit_derivative(q_prime, q_double_prime, opt.max_velocity, opt.epsilon);
     }
 
-    // TCP is strictly the active constraint — use numerical finite differences.
-    // tcp_vel_limit is the TCP limit at s, evaluated with the caller's side-specific
-    // tangent. At segment boundaries q_prime differs on each side; using it as the
-    // anchor ensures the derivative is consistent with the side being evaluated.
-    const auto tcp_s = tcp_vel_limit;
+    // TCP is strictly active OR we are epsilon-close to a joint/TCP crossover.
+    // In both cases, use numerical finite differences on the combined curve.
+    //
+    // At crossover ties, the combined curve min(joint, TCP) can be continuous
+    // but non-differentiable. Using the combined anchor keeps the derivative
+    // estimate mathematically consistent with the actual limit curve.
+    const auto combined_s = std::min(joint_vel_limit, tcp_vel_limit);
 
     // [Fix #4] Choose h based on path scale, clamped to a safe range.
     // Floor of 1e-10 prevents floating-point cancellation in (f(s+h) - f(s))
@@ -357,7 +361,7 @@ auto compute_velocity_limit_derivative_with_tcp(const xt::xarray<double>& q_prim
         return safe_velocity_limit_derivative(q_prime, q_double_prime, opt.max_velocity, opt.epsilon);
     }
 
-    // Compute one-sided differences anchored at tcp_s. Each neighbor is evaluated
+    // Compute one-sided differences anchored at combined_s. Each neighbor is evaluated
     // using the combined velocity limit min(joint, TCP) at that point, not just
     // TCP alone. This is critical: if the joint curve crosses below TCP within the
     // finite difference window, evaluating TCP alone would miss the crossover and
@@ -366,8 +370,7 @@ auto compute_velocity_limit_derivative_with_tcp(const xt::xarray<double>& q_prim
     // the derivative to detect escape conditions and switching points — a slope
     // that ignores a nearby joint crossover can cause missed switching points.
     //
-    // tcp_s is the combined limit at s (since TCP is strictly active there), so
-    // d = (tcp_s - combined_neighbor) / h gives the secant of the combined curve
+    // d = (combined_s - combined_neighbor) / h gives the secant of the combined curve
     // over the interval.
     //
     // We also measure how much the neighbor's tangent differs from the passed-in
@@ -398,7 +401,7 @@ auto compute_velocity_limit_derivative_with_tcp(const xt::xarray<double>& q_prim
         // AND TCP is at a singularity), making the difference meaningless.
         back_usable = std::isfinite(static_cast<double>(combined_back));
         if (back_usable) {
-            d_back = static_cast<double>(tcp_s - combined_back) / static_cast<double>(h_back);
+            d_back = static_cast<double>(combined_s - combined_back) / static_cast<double>(h_back);
 
             tangent_dist_sq_back = 0.0;
             for (size_t i = 0; i < q_prime.size(); ++i) {
@@ -431,7 +434,7 @@ auto compute_velocity_limit_derivative_with_tcp(const xt::xarray<double>& q_prim
         // [Fix #6] Same guard as backward side.
         fwd_usable = std::isfinite(static_cast<double>(combined_fwd));
         if (fwd_usable) {
-            d_fwd = static_cast<double>(combined_fwd - tcp_s) / static_cast<double>(h_fwd);
+            d_fwd = static_cast<double>(combined_fwd - combined_s) / static_cast<double>(h_fwd);
 
             tangent_dist_sq_fwd = 0.0;
             for (size_t i = 0; i < q_prime.size(); ++i) {
@@ -865,21 +868,20 @@ switching_point find_velocity_switching_point(path::cursor cursor, const traject
         // If velocity limit is degenerate (near zero) on either side, this is a switching point where we must come to rest
         if (abs(s_dot_max_vel_before) < opt.epsilon || abs(s_dot_max_vel_after) < opt.epsilon) {
             // Must stop at this boundary (or nearly so)
-            const auto switching_velocity = std::min(std::min(s_dot_max_vel_before, s_dot_max_vel_after), arc_velocity{0.0});
+            const auto switching_velocity = std::max(arc_velocity{0.0}, std::min(s_dot_max_vel_before, s_dot_max_vel_after));
             discontinuous_switching_point = switching_point{.point = {.s = boundary, .s_dot = switching_velocity},
                                                             .kind = trajectory::switching_point_kind::k_discontinuous_velocity_limit};
             break;  // This is the first (most constraining) discontinuous point
         }
 
-        // We can't call `compute_acceleration_bounds` unless this holds; this is a `Divergence 2`
-        // type check.
-        if (opt.epsilon.wrap(s_dot_max_accel_before) <= opt.epsilon.wrap(s_dot_max_vel_before)) {
+        // If acceleration is strictly tighter, the combined limit at this side is
+        // not the velocity curve, so velocity-case equations 41/42 don't apply.
+        if (opt.epsilon.wrap(s_dot_max_accel_before) < opt.epsilon.wrap(s_dot_max_vel_before)) {
             continue;
         }
 
-        // We can't call `compute_acceleration_bounds` unless this holds; this is a `Divergence 2`
-        // type check.
-        if (opt.epsilon.wrap(s_dot_max_accel_after) <= opt.epsilon.wrap(s_dot_max_vel_after)) {
+        // Same check for the right side.
+        if (opt.epsilon.wrap(s_dot_max_accel_after) < opt.epsilon.wrap(s_dot_max_vel_after)) {
             continue;
         }
 
@@ -937,159 +939,139 @@ switching_point find_velocity_switching_point(path::cursor cursor, const traject
         }
     }
 
-    // TODO(RSDK-12980): The following multi-phase search isn't quite correct, because if we find a velocity
-    // switching point but reject it as infeasible (e.g. the acceleration limit curve dominates there), we
-    // don't keep looking.
-
-    // Phase 2: Coarse forward search for continuous escape condition (Kunz & Stilman equation 40).
-    // Walk along the velocity limit curve until we find a point where s_ddot_min/s_dot <= curve_slope,
-    // indicating the trajectory can drop below the curve and resume normal acceleration.
-    // If we already found a discontinuous switching point, we can bound the search to stop there.
-    std::optional<arc_length> escape_region_start;
-    auto previous_position = cursor.position();
+    // Phase 2+3: Coarse search + bisection refinement for continuous velocity
+    // switching points (Kunz & Stilman equation 40 with dimensional correction).
+    //
+    // We only evaluate the equation where the velocity curve is actually active in
+    // the combined limit (s_dot_max_vel <= s_dot_max_acc). The search starts from
+    // the current position and, if a candidate is rejected as infeasible, continues
+    // forward to find the next one.
     const auto search_limit = discontinuous_switching_point.has_value() ? discontinuous_switching_point->point.s : path_length;
+    auto search_cursor = cursor;
 
-    auto search_cursor = cursor;  // this creates a copy of cursor but preserves the pattern above of having a `boundary_cursor`
-
-    // TCP introduces smooth variation in the velocity limit curve mid-segment (because J(q(s))
-    // changes with configuration even on linear segments where f'(s) is constant). Use a finer
-    // step to avoid missing narrow TCP features.
+    // TCP introduces smooth variation in the velocity limit curve mid-segment
+    // through J(q(s)); use a finer scan step to avoid missing narrow features.
     const auto coarse_step = opt.tcp.has_value()
         ? arc_length{opt.delta.count() / 10.0}
         : arc_length{opt.delta.count()};
 
-    while (search_cursor.position() < search_limit) {
-        // Advance cursor by step size.
-        //
-        // NOTE: The use of `opt.delta` here is definitely cheating:
-        // it is a duration, not a distance, hence the need to convert
-        // to arc_length. However, we haven't found a better way to
-        // identify what the right space delta is. Since `opt.delta`
-        // is at least configurable, this doesn't seem to unreasonable
-        // as a starting point.
-        const auto next_position = search_cursor.position() + coarse_step;
-        if (next_position > search_limit) {
-            break;  // Exceeded search limit without finding escape
-        }
-        search_cursor.seek(next_position);
+    struct escape_eval {
+        phase_plane_slope delta;  // (s_ddot_min / s_dot_max_vel) - (d/ds s_dot_max_vel)
+    };
 
-        // Query geometry at current position
-        const auto q_prime = search_cursor.tangent();
-        const auto q_double_prime = search_cursor.curvature();
+    auto evaluate_escape_condition = [&](path::cursor& c) -> std::optional<escape_eval> {
+        const auto q_prime = c.tangent();
+        const auto q_double_prime = c.curvature();
 
-        // Compute velocity limit and its derivative at this position
         const auto [s_dot_max_acc, s_dot_max_vel] =
             compute_velocity_limits_with_tcp(q_prime, q_double_prime, opt.max_velocity, opt.max_acceleration, opt.epsilon,
-                                              search_cursor.configuration(), opt);
+                                             c.configuration(), opt);
 
-        // Velocity limit must be positive to evaluate escape condition
         if (s_dot_max_vel < opt.epsilon) {
-            previous_position = search_cursor.position();
-            continue;  // Skip positions with degenerate velocity limits
+            return std::nullopt;
         }
 
-        // We can't call `compute_acceleration_bounds` unless this holds. Effectively, this is an
-        // instance of `Divergence 2` type behavior.
+        // If acceleration is strictly tighter, velocity Eq. 40 is not applicable.
         if (opt.epsilon.wrap(s_dot_max_acc) < opt.epsilon.wrap(s_dot_max_vel)) {
-            previous_position = search_cursor.position();
-            continue;
+            return std::nullopt;
         }
 
-        const auto curve_slope = compute_velocity_limit_derivative_with_tcp(q_prime, q_double_prime, search_cursor, opt);
-
-        // Compute minimum acceleration at velocity limit (equation 40 condition)
-        const auto [s_ddot_min, s_ddot_max] =
-            compute_acceleration_bounds(q_prime, q_double_prime, s_dot_max_vel, opt.max_acceleration, opt.epsilon);
-
-        // Escape condition: trajectory slope (s_ddot_min / s_dot) equal to curve slope.
-        // This means applying minimum acceleration would cause trajectory to drop below velocity limit.
+        const auto curve_slope = compute_velocity_limit_derivative_with_tcp(q_prime, q_double_prime, c, opt);
+        const auto [s_ddot_min, _1] = compute_acceleration_bounds(q_prime, q_double_prime, s_dot_max_vel, opt.max_acceleration, opt.epsilon);
         const auto trajectory_slope = s_ddot_min / s_dot_max_vel;
+        return escape_eval{.delta = trajectory_slope - curve_slope};
+    };
 
-        if (opt.epsilon.wrap(trajectory_slope) <= opt.epsilon.wrap(curve_slope)) {
-            // Found escape region - record where we first detected it
-            escape_region_start = search_cursor.position();
+    auto scan_start = cursor.position();
+    constexpr int max_bisection_iterations = 100;
+    const auto zero_slope = phase_plane_slope{0.0};
+
+    while (scan_start < search_limit) {
+        search_cursor.seek(scan_start);
+        auto previous_position = search_cursor.position();
+        bool seen_nonnegative_delta = false;
+        std::optional<std::pair<arc_length, arc_length>> bracket;
+
+        // Coarse scan to bracket the first sign transition of Eq. 40:
+        // delta = (s_ddot_min / s_dot_max_vel) - d/ds(s_dot_max_vel)
+        // We follow the original logic: first observe delta >= 0, then detect
+        // the first point where delta <= 0.
+        while (search_cursor.position() < search_limit) {
+            const auto next_position = search_cursor.position() + coarse_step;
+            if (next_position > search_limit) {
+                break;
+            }
+            search_cursor.seek(next_position);
+
+            const auto eval = evaluate_escape_condition(search_cursor);
+            if (!eval.has_value()) {
+                seen_nonnegative_delta = false;
+                previous_position = search_cursor.position();
+                continue;
+            }
+
+            if (!seen_nonnegative_delta && opt.epsilon.wrap(eval->delta) >= opt.epsilon.wrap(zero_slope)) {
+                seen_nonnegative_delta = true;
+            }
+
+            if (seen_nonnegative_delta && opt.epsilon.wrap(eval->delta) <= opt.epsilon.wrap(zero_slope)) {
+                bracket = std::pair{previous_position, search_cursor.position()};
+                break;
+            }
+
+            previous_position = search_cursor.position();
+        }
+
+        if (!bracket.has_value()) {
             break;
         }
 
-        // Update previous position for next iteration
-        previous_position = search_cursor.position();
-    }
-
-    // Phase 3: Bisection refinement to find exact continuous switching point (if escape region found).
-    if (escape_region_start) {
-        // We know escape is possible somewhere in the last step [previous_position, escape_region_start].
-        // Bisect over this interval to find the exact location where the escape condition becomes true.
-        auto before = previous_position;
-        auto after = *escape_region_start;
-
-        // TODO(RSDK-12767): Eleminiate this hardcoded constant.
-        constexpr int max_bisection_iterations = 100;
+        // Bisection refinement within the bracket.
+        auto before = bracket->first;
+        auto after = bracket->second;
         for (int iteration = 0; iteration < max_bisection_iterations; ++iteration) {
-            // Check convergence
             if (opt.epsilon.wrap(before) == opt.epsilon.wrap(after)) {
                 break;
             }
 
-            // Evaluate midpoint
             const auto mid = before + ((after - before) / 2.0);
             search_cursor.seek(mid);
+            const auto eval = evaluate_escape_condition(search_cursor);
 
-            const auto q_prime = search_cursor.tangent();
-            const auto q_double_prime = search_cursor.curvature();
-
-            const auto [s_dot_max_acc, s_dot_max_vel] =
-                compute_velocity_limits_with_tcp(q_prime, q_double_prime, opt.max_velocity, opt.max_acceleration, opt.epsilon,
-                                                  search_cursor.configuration(), opt);
-
-            if (s_dot_max_vel < opt.epsilon) {
-                // Degenerate case - skip to after
+            // If midpoint is not on the active velocity curve, push right.
+            if (!eval.has_value()) {
                 before = mid;
                 continue;
             }
 
-            // This is an instance of `Divergence 2` type behavior, where we are eliminating
-            // switching points that impossible w.r.t. the other curve.
-            //
-            // TODO(RSDK-12980): This also seems not quite right. How do we know which side of the bisection
-            // to pursue when the limit curves can swap around like this.
-            if (opt.epsilon.wrap(s_dot_max_acc) < opt.epsilon.wrap(s_dot_max_vel)) {
-                before = mid;
-                continue;
-            }
-
-            const auto curve_slope = compute_velocity_limit_derivative_with_tcp(q_prime, q_double_prime, search_cursor, opt);
-
-            const auto [s_ddot_min, s_ddot_max] =
-                compute_acceleration_bounds(q_prime, q_double_prime, s_dot_max_vel, opt.max_acceleration, opt.epsilon);
-
-            const auto trajectory_slope = s_ddot_min / s_dot_max_vel;
-
-            if (opt.epsilon.wrap(trajectory_slope) <= opt.epsilon.wrap(curve_slope)) {
-                // Midpoint satisfies escape condition - narrow to [before, mid]
+            if (opt.epsilon.wrap(eval->delta) <= opt.epsilon.wrap(zero_slope)) {
                 after = mid;
             } else {
-                // Midpoint doesn't satisfy escape - narrow to [mid, after]
                 before = mid;
             }
         }
 
-        // Store the refined continuous switching point
+        // Candidate at refined `after`.
         search_cursor.seek(after);
         const auto q_prime = search_cursor.tangent();
         const auto q_double_prime = search_cursor.curvature();
         const auto [s_dot_max_acc, s_dot_max_vel] =
             compute_velocity_limits_with_tcp(q_prime, q_double_prime, opt.max_velocity, opt.max_acceleration, opt.epsilon,
-                                              search_cursor.configuration(), opt);
+                                             search_cursor.configuration(), opt);
 
-        // `Reject switching points where s_dot_max_vel > s_dot_max_acc.
-        //
-        // If the velocity switching point has s_dot > s_dot_max_acc, backward integration will immediately
-        // hit the acceleration limit curve, causing the algorithm to fail. We should continue searching
-        // forward until finding a switching point where s_dot_max_vel <= s_dot_max_acc + epsilon.
         if (opt.epsilon.wrap(s_dot_max_vel) <= opt.epsilon.wrap(s_dot_max_acc)) {
             continuous_switching_point =
                 switching_point{.point = {.s = after, .s_dot = s_dot_max_vel}, .kind = trajectory::switching_point_kind::k_velocity_escape};
+            break;
         }
+
+        // Rejected candidate (acceleration curve became tighter): continue searching.
+        const auto advance = std::max(static_cast<double>(opt.epsilon), static_cast<double>(coarse_step) * 0.1);
+        const auto next_scan_start = std::min(after + arc_length{advance}, search_limit);
+        if (opt.epsilon.wrap(next_scan_start) == opt.epsilon.wrap(scan_start)) {
+            break;
+        }
+        scan_start = next_scan_start;
     }
 
     // Phase 4: Return whichever switching point comes first.

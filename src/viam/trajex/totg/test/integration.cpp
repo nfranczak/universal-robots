@@ -3,6 +3,7 @@
 #include <cmath>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 #include <json/json.h>
@@ -724,6 +725,71 @@ std::vector<constraint_profile> get_ur_arm_constraint_profiles() {
     };
 }
 
+std::vector<trajectory::integration_observer::started_backward_event> collect_backward_events(
+    const trajectory_integration_event_collector& collector) {
+    std::vector<trajectory::integration_observer::started_backward_event> out;
+    out.reserve(collector.events().size());
+    for (const auto& ev : collector.events()) {
+        if (const auto* b = std::get_if<trajectory::integration_observer::started_backward_event>(&ev)) {
+            out.push_back(*b);
+        }
+    }
+    return out;
+}
+
+void assert_velocity_switching_points_are_feasible(const trajectory& traj,
+                                                   const std::vector<trajectory::integration_observer::started_backward_event>& backward_events) {
+    auto cursor = traj.path().create_cursor(arc_length{0.0});
+    for (const auto& ev : backward_events) {
+        if (ev.kind != trajectory::switching_point_kind::k_velocity_escape &&
+            ev.kind != trajectory::switching_point_kind::k_discontinuous_velocity_limit) {
+            continue;
+        }
+
+        cursor.seek(ev.start.s);
+        const auto limits = traj.get_velocity_limits(cursor);
+
+        BOOST_TEST_CONTEXT("Velocity switching point feasibility at s=" << static_cast<double>(ev.start.s)) {
+            // Velocity switching points must lie on or below the acceleration limit curve.
+            BOOST_CHECK_GE(static_cast<double>(limits.s_dot_max_acc) + 1e-9, static_cast<double>(limits.s_dot_max_vel));
+            // Backward integration start velocity should match the active velocity limit.
+            BOOST_CHECK_LE(static_cast<double>(ev.start.s_dot), static_cast<double>(limits.s_dot_max_vel) + 1e-6);
+        }
+    }
+}
+
+double compute_joint_velocity_limit_for_test(const xt::xarray<double>& q_prime, const xt::xarray<double>& q_dot_max) {
+    double joint_limit = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < q_prime.shape(0); ++i) {
+        const double a = std::abs(q_prime(i));
+        if (a <= 1e-12) {
+            continue;
+        }
+        joint_limit = std::min(joint_limit, q_dot_max(i) / a);
+    }
+    return joint_limit;
+}
+
+double compute_tcp_velocity_limit_for_test(
+    const xt::xarray<double>& q,
+    const xt::xarray<double>& q_prime,
+    const std::function<xt::xarray<double>(const xt::xarray<double>&)>& jacobian,
+    double tcp_max_velocity) {
+    const auto J = jacobian(q);
+    double norm_sq = 0.0;
+    for (size_t r = 0; r < J.shape(0); ++r) {
+        double dot = 0.0;
+        for (size_t c = 0; c < J.shape(1); ++c) {
+            dot += J(r, c) * q_prime(c);
+        }
+        norm_sq += dot * dot;
+    }
+    if (norm_sq <= 1e-18) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return tcp_max_velocity / std::sqrt(norm_sq);
+}
+
 }  // namespace
 
 BOOST_AUTO_TEST_SUITE(end_to_end_tests)
@@ -1037,6 +1103,174 @@ BOOST_AUTO_TEST_CASE(RSDK_12979_nondifferentiable_switching_point_requires_zero_
         .expect_splice();
 
     const trajectory traj = fixture.create_and_validate();
+}
+
+BOOST_AUTO_TEST_CASE(velocity_switching_points_observer_sequence_and_feasibility_no_tcp) {
+    using namespace viam::trajex::totg;
+
+    trajectory_test_fixture fixture(3, 0.2);
+    // This case intentionally exercises aggressive switching behavior. We use a
+    // looser invariant tolerance to avoid failing on known integration residuals
+    // unrelated to switching-point classification.
+    fixture.validation_tolerance_percent = 60.0;
+
+    fixture
+        .set_waypoints_rad({
+            {0.0, 0.0, 0.0},
+            {0.95217205200296684, -0.55543447867938345, -0.58378792930776946},
+            {0.50744035567464985, -0.49324119712881376, 0.79015312261547854},
+            {0.14785826865432794, -0.29844476204205794, 0.66538748172749052},
+        })
+        .set_max_velocity(xt::xarray<double>{1.0881320673876185, 1.8704256225392104, 0.20418213172148938})
+        .set_max_acceleration(xt::xarray<double>{3.66420506233721, 0.82859656120203251, 3.938937565337528})
+        .set_max_deviation(0.15);
+
+    fixture.traj_opts.delta = trajectory::seconds{0.001};
+
+    auto collector = fixture.composite_observer_.add_observer(std::make_shared<trajectory_integration_event_collector>());
+
+    fixture.expectation_observer_->expect_forward_start()
+        .expect_hit_limit()
+        .expect_backward_start(std::nullopt, std::nullopt, trajectory::switching_point_kind::k_velocity_escape)
+        .expect_splice()
+        .expect_forward_start()
+        .expect_hit_limit()
+        .expect_backward_start(std::nullopt, std::nullopt, trajectory::switching_point_kind::k_discontinuous_velocity_limit)
+        .expect_splice()
+        .expect_forward_start()
+        .expect_backward_start(std::nullopt, std::nullopt, trajectory::switching_point_kind::k_path_end)
+        .expect_splice();
+
+    const trajectory traj = fixture.create_and_validate();
+
+    const auto backward_events = collect_backward_events(*collector);
+
+    int velocity_escape_count = 0;
+    int discontinuous_velocity_count = 0;
+    double velocity_escape_s = std::numeric_limits<double>::infinity();
+    double discontinuous_velocity_s = std::numeric_limits<double>::infinity();
+    for (const auto& ev : backward_events) {
+        if (ev.kind == trajectory::switching_point_kind::k_velocity_escape) {
+            ++velocity_escape_count;
+            velocity_escape_s = std::min(velocity_escape_s, static_cast<double>(ev.start.s));
+        }
+        if (ev.kind == trajectory::switching_point_kind::k_discontinuous_velocity_limit) {
+            ++discontinuous_velocity_count;
+            discontinuous_velocity_s = std::min(discontinuous_velocity_s, static_cast<double>(ev.start.s));
+        }
+    }
+
+    BOOST_CHECK_EQUAL(velocity_escape_count, 1);
+    BOOST_CHECK_EQUAL(discontinuous_velocity_count, 1);
+    BOOST_CHECK_LT(velocity_escape_s, discontinuous_velocity_s);
+
+    assert_velocity_switching_points_are_feasible(traj, backward_events);
+}
+
+BOOST_AUTO_TEST_CASE(tcp_velocity_switching_handles_joint_tcp_branch_mix_and_ties) {
+    using namespace viam::trajex::totg;
+
+    auto jac = [](const xt::xarray<double>& q) -> xt::xarray<double> {
+        xt::xarray<double> J = xt::zeros<double>(std::array<std::size_t, 2>{3, 3});
+        const double k0 = 0.7 + 0.25 * std::sin(2.1 * q(0)) + 0.15 * std::cos(1.3 * q(1));
+        const double k1 = 0.5 + 0.2 * std::cos(1.7 * q(1));
+        const double k2 = 0.4 + 0.2 * std::sin(1.9 * q(2));
+
+        J(0, 0) = k0;
+        J(0, 1) = 0.35;
+        J(0, 2) = 0.15;
+
+        J(1, 0) = 0.1;
+        J(1, 1) = k1;
+        J(1, 2) = 0.2;
+
+        J(2, 0) = 0.05;
+        J(2, 1) = 0.1;
+        J(2, 2) = k2;
+        return J;
+    };
+
+    trajectory_test_fixture fixture(3, 0.2);
+    // TCP branch-mixing cases can produce larger numerical residuals in the
+    // invariant checker; keep tolerance focused on switching-point behavior.
+    fixture.validation_tolerance_percent = 60.0;
+
+    fixture
+        .set_waypoints_rad({
+            {0.0, 0.0, 0.0},
+            {-0.53313626544502424, -1.1889875446963825, 0.98109645584458405},
+            {0.2853487539790569, 0.84334707310789425, 0.071562315796305231},
+            {-0.085064711184666741, 0.3581139400216371, -0.8615669836567259},
+        })
+        .set_max_velocity(xt::xarray<double>{0.99889538680278078, 0.26468353693200658, 0.81131853737794102})
+        .set_max_acceleration(xt::xarray<double>{2.1100684492346025, 2.7539742692047295, 1.3206758597072912})
+        .set_max_deviation(0.15);
+
+    fixture.traj_opts.delta = trajectory::seconds{0.001};
+    fixture.traj_opts.tcp = trajectory::tcp_limit{.max_velocity = 0.47009975652868374, .jacobian = jac};
+
+    auto collector = fixture.composite_observer_.add_observer(std::make_shared<trajectory_integration_event_collector>());
+
+    fixture.expectation_observer_->expect_forward_start()
+        .expect_hit_limit()
+        .expect_backward_start(std::nullopt, std::nullopt, trajectory::switching_point_kind::k_discontinuous_curvature)
+        .expect_splice()
+        .expect_forward_start()
+        .expect_hit_limit()
+        .expect_backward_start(std::nullopt, std::nullopt, trajectory::switching_point_kind::k_nondifferentiable_extremum)
+        .expect_splice()
+        .expect_forward_start()
+        .expect_hit_limit()
+        .expect_backward_start(std::nullopt, std::nullopt, trajectory::switching_point_kind::k_velocity_escape)
+        .expect_splice()
+        .expect_forward_start()
+        .expect_backward_start(std::nullopt, std::nullopt, trajectory::switching_point_kind::k_path_end)
+        .expect_splice();
+
+    const trajectory traj = fixture.create_and_validate();
+    const auto backward_events = collect_backward_events(*collector);
+
+    int velocity_escape_count = 0;
+    for (const auto& ev : backward_events) {
+        if (ev.kind == trajectory::switching_point_kind::k_velocity_escape) {
+            ++velocity_escape_count;
+        }
+    }
+    BOOST_CHECK_EQUAL(velocity_escape_count, 1);
+
+    assert_velocity_switching_points_are_feasible(traj, backward_events);
+
+    auto cursor = traj.path().create_cursor(arc_length{0.0});
+    const double path_length = static_cast<double>(traj.path().length());
+    int joint_active = 0;
+    int tcp_active = 0;
+    int near_ties = 0;
+    for (int i = 0; i <= 2000; ++i) {
+        const auto s = arc_length{path_length * static_cast<double>(i) / 2000.0};
+        cursor.seek(s);
+        const auto q = cursor.configuration();
+        const auto q_prime = cursor.tangent();
+        const double joint_limit = compute_joint_velocity_limit_for_test(q_prime, fixture.traj_opts.max_velocity);
+        const double tcp_limit = compute_tcp_velocity_limit_for_test(q, q_prime, jac, fixture.traj_opts.tcp->max_velocity);
+
+        if (!std::isfinite(joint_limit) || !std::isfinite(tcp_limit)) {
+            continue;
+        }
+
+        const double rel = std::abs(joint_limit - tcp_limit) / std::max(1e-12, std::min(joint_limit, tcp_limit));
+        if (rel < 1e-3) {
+            ++near_ties;
+        }
+        if (joint_limit < tcp_limit) {
+            ++joint_active;
+        } else if (tcp_limit < joint_limit) {
+            ++tcp_active;
+        }
+    }
+
+    BOOST_CHECK_GT(joint_active, 0);
+    BOOST_CHECK_GT(tcp_active, 0);
+    BOOST_CHECK_GT(near_ties, 0);
 }
 
 BOOST_AUTO_TEST_CASE(trajectory_json_serialization) {
