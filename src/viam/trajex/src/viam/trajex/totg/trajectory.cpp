@@ -264,6 +264,47 @@ arc_velocity compute_tcp_velocity_limit(const xt::xarray<double>& q,
     return arc_velocity{tcp.max_velocity / norm};
 }
 
+// Cursor-based overload: evaluates TCP velocity limit at the cursor's current position.
+arc_velocity compute_tcp_velocity_limit(const path::cursor& cursor,
+                                         const trajectory::tcp_limit& tcp,
+                                         class epsilon epsilon) {
+    return compute_tcp_velocity_limit(cursor.configuration(), cursor.tangent(), tcp, epsilon);
+}
+
+// Computes the combined velocity limit: min(joint_vel_limit, tcp_vel_limit).
+// Returns the joint-only velocity limit when TCP is not configured.
+// Also returns a flag indicating whether TCP is the active constraint.
+struct combined_velocity_limit_result {
+    arc_velocity s_dot_max_vel;  // min(joint, tcp)
+    bool tcp_active;             // true when TCP limit < joint limit
+};
+
+[[gnu::pure]] combined_velocity_limit_result compute_combined_velocity_limit(
+    const path::cursor& cursor,
+    const trajectory::options& opt) {
+    const auto q_prime = cursor.tangent();
+
+    // Joint velocity limit (Eq 36)
+    arc_velocity s_dot_max_vel_joint{std::numeric_limits<double>::infinity()};
+    for (size_t i = 0; i < q_prime.size(); ++i) {
+        if (std::abs(q_prime(i)) < opt.epsilon) {
+            continue;
+        }
+        const auto limit = opt.max_velocity(i) / std::abs(q_prime(i));
+        s_dot_max_vel_joint = std::min(s_dot_max_vel_joint, arc_velocity{limit});
+    }
+
+    if (!opt.tcp.has_value()) {
+        return {s_dot_max_vel_joint, false};
+    }
+
+    const auto s_dot_max_vel_tcp = compute_tcp_velocity_limit(cursor, *opt.tcp, opt.epsilon);
+    if (s_dot_max_vel_tcp < s_dot_max_vel_joint) {
+        return {s_dot_max_vel_tcp, true};
+    }
+    return {s_dot_max_vel_joint, false};
+}
+
 // Wrapper around compute_velocity_limits that folds in TCP velocity limit.
 // If TCP is enabled, computes min(joint_vel_limit, tcp_vel_limit) for s_dot_max_vel.
 // This replaces all direct compute_velocity_limits calls.
@@ -282,6 +323,34 @@ trajectory::velocity_limits compute_velocity_limits_with_tcp(const xt::xarray<do
     }
 
     return limits;
+
+// Computes d/ds s_dot_max_vel_tcp(s) via numerical central differences.
+// Steps the cursor ±epsilon around its current position to approximate the slope.
+// Takes cursor by value to avoid mutating the caller's cursor.
+auto compute_tcp_velocity_limit_derivative(path::cursor cursor,
+                                            const trajectory::tcp_limit& tcp,
+                                            class epsilon epsilon) {
+    const auto s = cursor.position();
+    const auto path_length = cursor.path().length();
+    const auto step = arc_length{epsilon};
+
+    // Clamp to valid path bounds to avoid sentinel position
+    const auto s_before = std::max(s - step, arc_length{0.0});
+    const auto s_after = std::min(s + step, path_length);
+    const auto ds = s_after - s_before;
+
+    // If clamped to a single point (path shorter than 2*epsilon), return zero slope
+    if (ds < epsilon * 0.5) {
+        return phase_plane_slope{0.0};
+    }
+
+    cursor.seek(s_before);
+    const auto limit_before = compute_tcp_velocity_limit(cursor, tcp, epsilon);
+
+    cursor.seek(s_after);
+    const auto limit_after = compute_tcp_velocity_limit(cursor, tcp, epsilon);
+
+    return phase_plane_slope{(static_cast<double>(limit_after) - static_cast<double>(limit_before)) / static_cast<double>(ds)};
 }
 
 // Computes derivative of the combined velocity limit curve (joint + TCP).
@@ -500,6 +569,7 @@ struct eq40_result {
     const auto [s_dot_max_acc, s_dot_max_vel] =
         compute_velocity_limits_with_tcp(q_prime, q_double_prime, opt.max_velocity, opt.max_acceleration, opt.epsilon,
                                          cursor.configuration(), opt);
+
 
     if (s_dot_max_vel == arc_velocity{0.0}) {
         return std::nullopt;
@@ -1092,37 +1162,220 @@ std::optional<switching_point> find_continuous_velocity_switching_point(path::cu
     return std::nullopt;
 }
 
+// Searches for a TCP crossover switching point — where the active velocity constraint
+// switches between joint and TCP within a path segment.
+//
+// Scans forward computing g(s) = joint_vel_limit(s) - tcp_vel_limit(s).
+// A sign change indicates a crossover. Bisection refines the root.
+// At the root, Eq 41-42 conditions are evaluated using the derivative
+// of the active constraint on each side.
+std::optional<switching_point> find_tcp_crossover_switching_point(path::cursor cursor,
+                                                                    const trajectory::options& opt,
+                                                                    arc_length search_limit) {
+    if (!opt.tcp.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto& tcp = *opt.tcp;
+
+    // Helper: compute joint velocity limit at cursor position (Eq 36)
+    const auto compute_joint_vel_limit = [&](const path::cursor& c) -> arc_velocity {
+        const auto q_prime = c.tangent();
+        arc_velocity result{std::numeric_limits<double>::infinity()};
+        for (size_t i = 0; i < q_prime.size(); ++i) {
+            if (std::abs(q_prime(i)) < opt.epsilon) {
+                continue;
+            }
+            const auto limit = opt.max_velocity(i) / std::abs(q_prime(i));
+            result = std::min(result, arc_velocity{limit});
+        }
+        return result;
+    };
+
+    // Helper: evaluate g(s) = joint_vel_limit(s) - tcp_vel_limit(s)
+    const auto compute_g = [&](const path::cursor& c) -> double {
+        const auto joint = compute_joint_vel_limit(c);
+        const auto tcp_vel = compute_tcp_velocity_limit(c, tcp, opt.epsilon);
+        return static_cast<double>(joint) - static_cast<double>(tcp_vel);
+    };
+
+    auto search_cursor = cursor;
+    auto search_position = cursor.position();
+    auto previous_segment_end = (*search_cursor).end();
+
+    double previous_g = compute_g(search_cursor);
+    auto previous_position = search_position;
+
+    while (search_position < search_limit) {
+        // Advance by step size
+        const auto next_position = std::min(search_position + arc_length{opt.delta.count()}, search_limit);
+        if (next_position == search_position) {
+            break;
+        }
+
+        search_cursor.seek(next_position);
+        search_position = next_position;
+
+        // Reset across segment boundaries (crossover at boundary is handled by
+        // find_discontinuous_velocity_switching_point)
+        const auto current_segment_end = (*search_cursor).end();
+        if (current_segment_end != previous_segment_end) {
+            previous_g = compute_g(search_cursor);
+            previous_position = search_position;
+            previous_segment_end = current_segment_end;
+            continue;
+        }
+
+        const double current_g = compute_g(search_cursor);
+
+        // Check for sign change (crossover)
+        if ((previous_g > 0.0 && current_g <= 0.0) || (previous_g < 0.0 && current_g >= 0.0)) {
+            // Bisect to find root
+            auto left = previous_position;
+            auto right = search_position;
+            double g_left = previous_g;
+
+            constexpr int max_bisection = 100;
+            arc_length crossover_s = right;
+
+            for (int iter = 0; iter < max_bisection; ++iter) {
+                if (opt.epsilon.wrap(left) == opt.epsilon.wrap(right)) {
+                    crossover_s = ((g_left > 0.0) == (previous_g > 0.0)) ? right : left;
+                    break;
+                }
+
+                const auto mid = midpoint(left, right);
+                search_cursor.seek(mid);
+                const double g_mid = compute_g(search_cursor);
+
+                if (std::abs(g_mid) < opt.epsilon) {
+                    crossover_s = mid;
+                    break;
+                }
+
+                // Same sign as left -> root is in [mid, right]
+                if ((g_left > 0.0) == (g_mid > 0.0)) {
+                    left = mid;
+                    g_left = g_mid;
+                } else {
+                    right = mid;
+                }
+            }
+
+            // Evaluate switching point conditions (Eq 41-42) at crossover
+            search_cursor.seek(crossover_s);
+
+            // Compute the switching velocity (the value of the combined limit at crossover)
+            const auto combined = compute_combined_velocity_limit(search_cursor, opt);
+            const auto s_dot_at_crossover = combined.s_dot_max_vel;
+
+            if (s_dot_at_crossover == arc_velocity{0.0}) {
+                previous_g = current_g;
+                previous_position = search_position;
+                continue;
+            }
+
+            // Check feasibility: acceleration limit must be above velocity limit
+            const auto q_prime = search_cursor.tangent();
+            const auto q_double_prime = search_cursor.curvature();
+            const auto [s_dot_max_acc, unused_s_dot_max_vel] =
+                compute_velocity_limits(q_prime, q_double_prime, opt.max_velocity, opt.max_acceleration, opt.epsilon);
+
+            if (s_dot_max_acc < s_dot_at_crossover) {
+                previous_g = current_g;
+                previous_position = search_position;
+                continue;
+            }
+
+            // Determine which curve is active on each side.
+            // If previous_g > 0 -> joint > tcp -> TCP was active before, joint active after
+            // If previous_g < 0 -> joint < tcp -> joint was active before, TCP active after
+            const bool tcp_active_before = (previous_g > 0.0);
+            const bool tcp_active_after = !tcp_active_before;
+
+            // Compute derivative on each side using the active constraint
+            const auto slope_before = tcp_active_before
+                ? compute_tcp_velocity_limit_derivative(search_cursor, tcp, opt.epsilon)
+                : compute_velocity_limit_derivative(q_prime, q_double_prime, opt.max_velocity, opt.epsilon);
+
+            const auto slope_after = tcp_active_after
+                ? compute_tcp_velocity_limit_derivative(search_cursor, tcp, opt.epsilon)
+                : compute_velocity_limit_derivative(q_prime, q_double_prime, opt.max_velocity, opt.epsilon);
+
+            // Eq 41-42 conditions
+            const auto accel_bounds =
+                compute_acceleration_bounds(q_prime, q_double_prime, s_dot_at_crossover, opt.max_acceleration, opt.epsilon);
+            const auto trajectory_slope = accel_bounds.s_ddot_min / s_dot_at_crossover;
+
+            const bool condition_41 = trajectory_slope >= slope_before;
+            const bool condition_42 = trajectory_slope <= slope_after;
+
+            if (condition_41 && condition_42) {
+                return switching_point{.point = {.s = crossover_s, .s_dot = s_dot_at_crossover},
+                                       .kind = trajectory::switching_point_kind::k_tcp_crossover};
+            }
+        }
+
+        previous_g = current_g;
+        previous_position = search_position;
+    }
+
+    return std::nullopt;
+}
+
 // Searches for a velocity switching point where escape from velocity curve becomes possible.
 // Implements both continuous (Kunz & Stilman equation 40, with `Correction 5`) and discontinuous
 // (Kunz & Stilman equations 41-42, with `Correction 6`) cases from Section VII-B.
 //
 // Returns the switching point on velocity curve. If no escape point found, returns end of path.
 // Takes path::cursor by value (cheap copy) to seed forward search from current position.
-[[gnu::pure]] switching_point find_velocity_switching_point(path::cursor cursor, const trajectory::options& opt) {
+switching_point find_velocity_switching_point(path::cursor cursor, const trajectory::options& opt) {
     const auto path_length = cursor.path().length();
 
     // Phase 1: boundary discontinuity search.
     const auto discontinuous_switching_point = find_discontinuous_velocity_switching_point(cursor, opt, path_length);
 
-    // Phase 2+3: continuous escape search, bounded by the discontinuous result if one was found.
-    const auto search_limit = discontinuous_switching_point.has_value() ? discontinuous_switching_point->point.s : path_length;
-    const auto continuous_switching_point = find_continuous_velocity_switching_point(cursor, search_limit, opt);
+    // Phase 1b: TCP crossover search.
+    const auto crossover_search_limit = discontinuous_switching_point.has_value()
+        ? discontinuous_switching_point->point.s : path_length;
+    const auto tcp_crossover_switching_point = find_tcp_crossover_switching_point(cursor, opt, crossover_search_limit);
 
-    // Phase 4: return whichever switching point comes first.
-    if (discontinuous_switching_point && continuous_switching_point) {
-        return select_switching_point(*discontinuous_switching_point, *continuous_switching_point, opt.epsilon);
+    // Phase 2+3: continuous escape search, bounded by earliest discontinuous result.
+    auto continuous_search_limit = crossover_search_limit;
+    if (tcp_crossover_switching_point.has_value()) {
+        continuous_search_limit = std::min(continuous_search_limit, tcp_crossover_switching_point->point.s);
     }
+    const auto continuous_switching_point = find_continuous_velocity_switching_point(cursor, continuous_search_limit, opt);
+
+    // Phase 4: return earliest switching point.
+    std::optional<switching_point> best;
 
     if (discontinuous_switching_point) {
-        return *discontinuous_switching_point;
+        best = *discontinuous_switching_point;
+    }
+
+    if (tcp_crossover_switching_point) {
+        if (best) {
+            best = select_switching_point(*best, *tcp_crossover_switching_point, opt.epsilon);
+        } else {
+            best = *tcp_crossover_switching_point;
+        }
     }
 
     if (continuous_switching_point) {
-        return *continuous_switching_point;
+        if (best) {
+            best = select_switching_point(*best, *continuous_switching_point, opt.epsilon);
+        } else {
+            best = *continuous_switching_point;
+        }
     }
 
-    // No switching point found - return end of path
-    return switching_point{.point = {.s = path_length, .s_dot = arc_velocity{0.0}}, .kind = trajectory::switching_point_kind::k_path_end};
+    if (best) {
+        return *best;
+    }
+
+    return switching_point{.point = {.s = path_length, .s_dot = arc_velocity{0.0}},
+                           .kind = trajectory::switching_point_kind::k_path_end};
 }
 
 // Unified switching point search that calls both acceleration and velocity searches.

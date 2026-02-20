@@ -325,4 +325,61 @@ BOOST_AUTO_TEST_CASE(ur20_spiral_phase_plane) {
     BOOST_CHECK_GE(traj.duration().count(), baseline.duration().count() - 0.001);
 }
 
+// Crossover test: a Jacobian that varies along a straight path so that
+// TCP velocity limit drops below joint limit partway through.
+// This verifies that the trajectory correctly follows the tighter of
+// joint and TCP limits and is slower than either constraint alone.
+BOOST_AUTO_TEST_CASE(crossover_constrains_trajectory) {
+    // Straight-line 3-DOF path along first joint axis
+    const xt::xarray<double> waypoints = {{0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}};
+    const auto p = path::create(waypoints);
+
+    // Position-dependent Jacobian: J(0,0) = 1 + q(0), rest identity.
+    // Along this path q(0) = s, so ||J*tangent|| = 1 + s.
+    // TCP limit = v_tcp_max / (1+s).
+    //   At s=0: TCP limit = v_tcp_max (high)
+    //   At s=2: TCP limit = v_tcp_max/3 (low)
+    auto scaling_jacobian = [](const xt::xarray<double>& q) -> xt::xarray<double> {
+        xt::xarray<double> J = xt::eye<double>(3);
+        J(0, 0) = 1.0 + q(0);
+        return J;
+    };
+
+    // Joint limit = max_vel / |tangent| = 1.0
+    // TCP limit = 2.0 / (1+s)
+    //   At s=0: TCP=2.0 > joint=1.0  -> joint is active
+    //   At s=1: TCP=1.0 = joint=1.0  -> crossover
+    //   At s=2: TCP=0.667 < joint=1.0 -> TCP is active
+    //
+    // The combined velocity limit is min(joint, TCP):
+    //   s < 1: combined = 1.0 (joint)
+    //   s > 1: combined = 2/(1+s) (TCP, decreasing)
+    //
+    // Baseline (no TCP): trajectory only constrained by joint limits.
+    trajectory_integration_event_collector baseline_collector;
+    trajectory::options baseline_opts{
+        .max_velocity = xt::xarray<double>{1.0, 1.0, 1.0},
+        .max_acceleration = xt::xarray<double>{2.0, 2.0, 2.0},
+    };
+    baseline_opts.observer = &baseline_collector;
+    const auto baseline = trajectory::create(p, baseline_opts);
+
+    // With TCP: trajectory is more constrained in the second half
+    trajectory_integration_event_collector tcp_collector;
+    trajectory::options tcp_opts{
+        .max_velocity = xt::xarray<double>{1.0, 1.0, 1.0},
+        .max_acceleration = xt::xarray<double>{2.0, 2.0, 2.0},
+        .tcp = make_tcp(2.0, scaling_jacobian),
+    };
+    tcp_opts.observer = &tcp_collector;
+    const auto with_tcp = trajectory::create(p, tcp_opts);
+    write_phase_plane_json("crossover_test.json", with_tcp, tcp_collector);
+
+    // TCP-constrained trajectory should be slower because the TCP limit
+    // restricts the second half of the path below the joint limit.
+    BOOST_CHECK_GT(with_tcp.duration().count(), baseline.duration().count());
+    BOOST_TEST_MESSAGE("Baseline duration: " << baseline.duration().count()
+                       << "s, TCP-constrained: " << with_tcp.duration().count() << "s");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
