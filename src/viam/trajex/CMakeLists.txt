@@ -299,6 +299,7 @@ target_sources(trajex-test
     src/viam/trajex/totg/test/uniform_sampler.cpp
     src/viam/trajex/totg/test/integration.cpp
     src/viam/trajex/totg/test/observers.cpp
+    src/viam/trajex/totg/test/tcp_velocity_limit.cpp
 )
 
 target_link_libraries(trajex-test
@@ -306,6 +307,7 @@ target_link_libraries(trajex-test
     viam::trajex::service
     Boost::boost
     jsoncpp_lib
+    jacobian
 )
 
 apply_wall_werror(trajex-test)

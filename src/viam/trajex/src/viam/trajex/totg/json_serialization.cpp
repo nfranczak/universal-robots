@@ -35,6 +35,8 @@ std::string switching_point_kind_to_string(trajectory::switching_point_kind kind
             return "k_velocity_escape";
         case trajectory::switching_point_kind::k_discontinuous_velocity_limit:
             return "k_discontinuous_velocity_limit";
+        case trajectory::switching_point_kind::k_tcp_crossover:
+            return "k_tcp_crossover";
         case trajectory::switching_point_kind::k_path_end:
             return "k_path_end";
     }

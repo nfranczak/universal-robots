@@ -175,6 +175,7 @@ def plot_phase_plane(data, ax):
         'k_nondifferentiable_extremum': ('D', 'Non-diff Extremum'),
         'k_velocity_escape': ('v', 'Velocity Escape'),
         'k_discontinuous_velocity_limit': ('p', 'Velocity Limit Discontinuity'),
+        'k_tcp_crossover': ('H', 'TCP Crossover'),
     }
 
     kind_seen = set()
