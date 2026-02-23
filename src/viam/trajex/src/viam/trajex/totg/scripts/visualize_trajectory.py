@@ -4,10 +4,15 @@ Visualize trajectory generation from JSON output.
 
 Usage:
     python scripts/visualize_trajectory.py trajectory.json
+
+Behavior:
+    - Saves an image next to the input JSON with the same basename (e.g. foo.json -> foo.png)
+    - Also shows the plot interactively (comment out plt.show() if you only want file output)
 """
 
 import json
 import sys
+import os
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -91,7 +96,7 @@ def plot_phase_plane(data, ax):
             # Show vertical drop when transitioning from infinite to finite
             if prev_was_inf and i > 0:
                 ax.plot([curr_s, curr_s], [y_max, curr_val], 'r-',
-                       linewidth=1, alpha=0.5, zorder=1)
+                        linewidth=1, alpha=0.5, zorder=1)
             prev_was_inf = False
             prev_s = curr_s
             prev_val = curr_val
@@ -99,7 +104,7 @@ def plot_phase_plane(data, ax):
             # Show vertical rise when transitioning from finite to infinite
             if not prev_was_inf and prev_s is not None and prev_val is not None:
                 ax.plot([prev_s, prev_s], [prev_val, y_max], 'r-',
-                       linewidth=1, alpha=0.5, zorder=1)
+                        linewidth=1, alpha=0.5, zorder=1)
             prev_was_inf = True
 
     # Plot the actual limit curve segments
@@ -133,7 +138,7 @@ def plot_phase_plane(data, ax):
             # Show vertical drop when transitioning from infinite to finite
             if prev_was_inf and i > 0:
                 ax.plot([curr_s, curr_s], [y_max, curr_val], 'orange',
-                       linewidth=1, alpha=0.5, zorder=1)
+                        linewidth=1, alpha=0.5, zorder=1)
             prev_was_inf = False
             prev_s = curr_s
             prev_val = curr_val
@@ -141,7 +146,7 @@ def plot_phase_plane(data, ax):
             # Show vertical rise when transitioning from finite to infinite
             if not prev_was_inf and prev_s is not None and prev_val is not None:
                 ax.plot([prev_s, prev_s], [prev_val, y_max], 'orange',
-                       linewidth=1, alpha=0.5, zorder=1)
+                        linewidth=1, alpha=0.5, zorder=1)
             prev_was_inf = True
 
     segments_vel = []
@@ -170,6 +175,7 @@ def plot_phase_plane(data, ax):
         'k_nondifferentiable_extremum': ('D', 'Non-diff Extremum'),
         'k_velocity_escape': ('v', 'Velocity Escape'),
         'k_discontinuous_velocity_limit': ('p', 'Velocity Limit Discontinuity'),
+        'k_tcp_crossover': ('H', 'TCP Crossover'),
     }
 
     kind_seen = set()
@@ -185,9 +191,9 @@ def plot_phase_plane(data, ax):
 
         # Hollow markers with transparency so they don't obscure the graph
         ax.scatter(float(event['s']), float(event['s_dot']),
-                  marker=marker, s=SWITCHING_POINT_SIZE, facecolors='none', edgecolors='blue',
-                  alpha=SWITCHING_POINT_ALPHA, linewidths=SWITCHING_POINT_LINE_WIDTH,
-                  label=label, zorder=4)
+                   marker=marker, s=SWITCHING_POINT_SIZE, facecolors='none', edgecolors='blue',
+                   alpha=SWITCHING_POINT_ALPHA, linewidths=SWITCHING_POINT_LINE_WIDTH,
+                   label=label, zorder=4)
 
     # Pruned points from splices (dashed green)
     pruned_shown = False
@@ -198,7 +204,7 @@ def plot_phase_plane(data, ax):
             s_dot_pruned = np.array([float(x) for x in pruned['s_dot']])
             label = 'Pruned (replaced)' if not pruned_shown else None
             ax.plot(s_pruned, s_dot_pruned, 'g--', alpha=0.4,
-                   linewidth=1.5, label=label, zorder=2.5)
+                    linewidth=1.5, label=label, zorder=2.5)
             pruned_shown = True
 
     # Limit hits (black 'x' markers)
@@ -335,6 +341,14 @@ def main():
     plot_arc_length_vs_time(data, ax_arc)
 
     plt.tight_layout(rect=[0, 0.03, 1, 1])  # Leave space for legend at bottom
+
+    # Save next to the input json with same basename
+    base, _ = os.path.splitext(filename)
+    out_path = base + ".png"
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    print(f"Saved plot to {out_path}")
+
+    # Optional: still show interactively. Comment out if you only want file output.
     plt.show()
 
 
