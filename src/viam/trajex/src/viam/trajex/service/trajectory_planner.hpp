@@ -35,6 +35,7 @@ struct trajectory_planner_base {
         double path_blend_tolerance = 0.0;
         std::optional<double> colinearization_ratio;
         bool segment_trajex = true;
+        std::optional<totg::trajectory::tcp_limit> tcp;
     };
 
     ///
@@ -295,6 +296,7 @@ class trajectory_planner : public trajectory_planner_base {
                 totg::trajectory::options topts;
                 topts.max_velocity = config_.velocity_limits;
                 topts.max_acceleration = config_.acceleration_limits;
+                topts.tcp = config_.tcp;
 
                 auto start = std::chrono::steady_clock::now();
                 auto traj = totg::trajectory::create(std::move(p), std::move(topts));

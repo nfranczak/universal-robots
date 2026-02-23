@@ -211,6 +211,7 @@ std::shared_ptr<trajex_mlmodel_service::named_tensor_views> trajex_mlmodel_servi
         .path_blend_tolerance = path_tolerance,
         .colinearization_ratio = colinearization_ratio,
         .segment_trajex = local_config.segment_for_totg,
+        .tcp = {},
     });
 
     planner

@@ -51,6 +51,9 @@
 #include <viam/trajex/types/angles.hpp>
 #include <viam/trajex/types/hertz.hpp>
 
+#include <jacobian.hpp>
+#include <urdf_parser.hpp>
+
 #if __has_include(<xtensor/containers/xarray.hpp>)
 #include <xtensor/containers/xadapt.hpp>
 #include <xtensor/containers/xarray.hpp>
@@ -905,11 +908,44 @@ void URArm::move_joint_space_(std::shared_lock<std::shared_mutex> config_rlock,
 
     VIAM_SDK_LOG(debug) << "move: compute_trajectory start " << unix_time;
 
+    // Set up TCP velocity limit for UR20 using closed-form Jacobian from URDF kinematic chain.
+    // Constrains the tool center point linear velocity to 1 m/s.
+    const auto tcp_limit = [&]() -> std::optional<viam::trajex::totg::trajectory::tcp_limit> {
+        if (model_ != model("ur20")) {
+            return std::nullopt;
+        }
+
+        const auto urdf_path = current_state_->resource_root() / "kinematics" / "ur20.urdf";
+        auto jac_model = std::make_shared<jacobian::Model>(
+            jacobian::parseURDF(urdf_path.string()));
+
+        return viam::trajex::totg::trajectory::tcp_limit{
+            .max_velocity = 1.0,
+            .jacobian = [jac_model](const xt::xarray<double>& q) -> xt::xarray<double> {
+                const auto n = static_cast<Eigen::Index>(q.size());
+                const Eigen::Map<const Eigen::VectorXd> q_eigen(q.data(), n);
+
+                jacobian::Data data(*jac_model);
+                jacobian::computeJacobian(*jac_model, q_eigen, data);
+
+                // Extract linear velocity rows (top 3 of 6xN) from closed-form Jacobian
+                xt::xarray<double> result = xt::zeros<double>({3u, static_cast<unsigned>(n)});
+                for (Eigen::Index r = 0; r < 3; ++r) {
+                    for (Eigen::Index c = 0; c < n; ++c) {
+                        result(static_cast<std::size_t>(r), static_cast<std::size_t>(c)) = data.J(r, c);
+                    }
+                }
+                return result;
+            },
+        };
+    }();
+
     auto planner = viam::trajex::trajectory_planner<segment_accumulator>({
         .velocity_limits = xt::adapt(velocity_limits_data),
         .acceleration_limits = xt::adapt(acceleration_limits_data),
         .path_blend_tolerance = current_state_->get_path_tolerance_delta_rads(),
         .colinearization_ratio = current_state_->get_path_colinearization_ratio(),
+        .tcp = tcp_limit,
     });
 
     planner

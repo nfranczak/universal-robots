@@ -323,6 +323,7 @@ trajectory::velocity_limits compute_velocity_limits_with_tcp(const xt::xarray<do
     }
 
     return limits;
+}
 
 // Computes d/ds s_dot_max_vel_tcp(s) via numerical central differences.
 // Steps the cursor ±epsilon around its current position to approximate the slope.
@@ -551,6 +552,7 @@ auto compute_velocity_limit_derivative_with_tcp(const xt::xarray<double>& q_prim
     }
 
     return phase_plane_slope{derivative};
+}
 
 struct eq40_result {
     phase_plane_slope delta;

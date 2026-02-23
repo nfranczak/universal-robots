@@ -1300,7 +1300,7 @@ BOOST_AUTO_TEST_CASE(velocity_switching_points_observer_sequence_and_feasibility
         })
         .set_max_velocity(xt::xarray<double>{1.0881320673876185, 1.8704256225392104, 0.20418213172148938})
         .set_max_acceleration(xt::xarray<double>{3.66420506233721, 0.82859656120203251, 3.938937565337528})
-        .set_max_deviation(0.15);
+        .set_max_blend_deviation(0.15);
 
     fixture.traj_opts.delta = trajectory::seconds{0.001};
 
@@ -1344,7 +1344,7 @@ BOOST_AUTO_TEST_CASE(velocity_switching_points_observer_sequence_and_feasibility
     assert_velocity_switching_points_are_feasible(traj, backward_events);
 }
 
-BOOST_AUTO_TEST_CASE(tcp_velocity_switching_handles_joint_tcp_branch_mix_and_ties) {
+BOOST_AUTO_TEST_CASE(RSDK_13338_tcp_velocity_switching_handles_joint_tcp_branch_mix_and_ties) {
     using namespace viam::trajex::totg;
 
     auto jac = [](const xt::xarray<double>& q) -> xt::xarray<double> {
@@ -1381,7 +1381,7 @@ BOOST_AUTO_TEST_CASE(tcp_velocity_switching_handles_joint_tcp_branch_mix_and_tie
         })
         .set_max_velocity(xt::xarray<double>{0.99889538680278078, 0.26468353693200658, 0.81131853737794102})
         .set_max_acceleration(xt::xarray<double>{2.1100684492346025, 2.7539742692047295, 1.3206758597072912})
-        .set_max_deviation(0.15);
+        .set_max_blend_deviation(0.15);
 
     fixture.traj_opts.delta = trajectory::seconds{0.001};
     fixture.traj_opts.tcp = trajectory::tcp_limit{.max_velocity = 0.47009975652868374, .jacobian = jac};

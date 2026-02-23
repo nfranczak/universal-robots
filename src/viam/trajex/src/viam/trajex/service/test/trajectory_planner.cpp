@@ -25,6 +25,7 @@ trajectory_planner<test_receiver>::config simple_config() {
         .acceleration_limits = xt::xarray<double>{1.0, 1.0, 1.0},
         .path_blend_tolerance = 0.001,
         .colinearization_ratio = std::nullopt,
+        .tcp = {},
     };
 }
 

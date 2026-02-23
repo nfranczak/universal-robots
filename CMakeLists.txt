@@ -172,6 +172,8 @@ FetchContent_MakeAvailable(trajex)
 
 enable_testing()
 
+add_subdirectory(third_party/jacobian)
+
 #
 # Declare targets
 #
@@ -244,6 +246,7 @@ target_link_libraries(viam-ur
     viam-cpp-sdk::viamapi # Proxy for gRPC
     viam-cpp-sdk::viamsdk
     jsoncpp_lib
+    jacobian
 )
 
 apply_wall_werror(viam-ur)
