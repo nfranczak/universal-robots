@@ -24,6 +24,10 @@
 #include <viam/trajex/service/sampling_utils.hpp>
 #include <viam/trajex/totg/waypoint_accumulator.hpp>
 
+namespace jacobian {
+struct Model;
+}  // namespace jacobian
+
 using namespace viam::sdk;
 using namespace urcl;
 
@@ -206,6 +210,7 @@ class URArm final : public Arm, public Reconfigurable {
 
     std::shared_mutex config_mutex_;
     std::unique_ptr<state_> current_state_;
+    std::shared_ptr<jacobian::Model> jac_model_;
 
     std::unordered_map<std::string, std::vector<std::string>> arm_name_to_model_parts_;
 };

@@ -894,7 +894,8 @@ void assert_velocity_switching_points_are_feasible(const trajectory& traj,
     auto cursor = traj.path().create_cursor(arc_length{0.0});
     for (const auto& ev : backward_events) {
         if (ev.kind != trajectory::switching_point_kind::k_velocity_escape &&
-            ev.kind != trajectory::switching_point_kind::k_discontinuous_velocity_limit) {
+            ev.kind != trajectory::switching_point_kind::k_discontinuous_velocity_limit &&
+            ev.kind != trajectory::switching_point_kind::k_tcp_crossover) {
             continue;
         }
 
@@ -910,11 +911,13 @@ void assert_velocity_switching_points_are_feasible(const trajectory& traj,
     }
 }
 
-double compute_joint_velocity_limit_for_test(const xt::xarray<double>& q_prime, const xt::xarray<double>& q_dot_max) {
+double compute_joint_velocity_limit_for_test(const xt::xarray<double>& q_prime,
+                                             const xt::xarray<double>& q_dot_max,
+                                             double eps = 1e-6) {
     double joint_limit = std::numeric_limits<double>::infinity();
     for (size_t i = 0; i < q_prime.shape(0); ++i) {
         const double a = std::abs(q_prime(i));
-        if (a <= 1e-12) {
+        if (a <= eps) {
             continue;
         }
         joint_limit = std::min(joint_limit, q_dot_max(i) / a);
@@ -926,7 +929,8 @@ double compute_tcp_velocity_limit_for_test(
     const xt::xarray<double>& q,
     const xt::xarray<double>& q_prime,
     const std::function<xt::xarray<double>(const xt::xarray<double>&)>& jacobian,
-    double tcp_max_velocity) {
+    double tcp_max_velocity,
+    double eps = 1e-6) {
     const auto J = jacobian(q);
     double norm_sq = 0.0;
     for (size_t r = 0; r < J.shape(0); ++r) {
@@ -936,7 +940,7 @@ double compute_tcp_velocity_limit_for_test(
         }
         norm_sq += dot * dot;
     }
-    if (norm_sq <= 1e-18) {
+    if (norm_sq <= eps * eps) {
         return std::numeric_limits<double>::infinity();
     }
     return tcp_max_velocity / std::sqrt(norm_sq);
@@ -1286,9 +1290,11 @@ BOOST_AUTO_TEST_CASE(velocity_switching_points_observer_sequence_and_feasibility
     using namespace viam::trajex::totg;
 
     trajectory_test_fixture fixture(3, 0.2);
-    // This case intentionally exercises aggressive switching behavior. We use a
-    // looser invariant tolerance to avoid failing on known integration residuals
-    // unrelated to switching-point classification.
+    // TCP branch-mixing near crossover points can cause the combined velocity limit
+    // curve to shift between joint and TCP within a single integration step. The
+    // trajectory follows one branch's slope while the invariant checker evaluates
+    // the other branch's limit, producing apparent violations up to the crossover
+    // gap. TODO(RSDK-13338): tighten once crossover-aware invariant checking is added.
     fixture.validation_tolerance_percent = 60.0;
 
     fixture
@@ -1368,8 +1374,11 @@ BOOST_AUTO_TEST_CASE(RSDK_13338_tcp_velocity_switching_handles_joint_tcp_branch_
     };
 
     trajectory_test_fixture fixture(3, 0.2);
-    // TCP branch-mixing cases can produce larger numerical residuals in the
-    // invariant checker; keep tolerance focused on switching-point behavior.
+    // TCP branch-mixing near crossover points can cause the combined velocity limit
+    // curve to shift between joint and TCP within a single integration step. The
+    // trajectory follows one branch's slope while the invariant checker evaluates
+    // the other branch's limit, producing apparent violations up to the crossover
+    // gap. TODO(RSDK-13338): tighten once crossover-aware invariant checking is added.
     fixture.validation_tolerance_percent = 60.0;
 
     fixture

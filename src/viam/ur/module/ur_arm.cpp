@@ -530,6 +530,13 @@ void URArm::configure_(const std::unique_lock<std::shared_mutex>& lock, const De
     VIAM_SDK_LOG(debug) << "URArm starting up";
     current_state_ = state_::create(configured_model_type, name(), cfg, ports_);
 
+    if (model_ == model("ur20")) {
+        const auto urdf_path = current_state_->resource_root() / "kinematics" / "ur20.urdf";
+        jac_model_ = std::make_shared<jacobian::Model>(jacobian::parseURDF(urdf_path.string()));
+    } else {
+        jac_model_ = nullptr;
+    }
+
     VIAM_SDK_LOG(info) << "URArm startup complete";
     failure_handler.deactivate();
 }
@@ -909,30 +916,30 @@ void URArm::move_joint_space_(std::shared_lock<std::shared_mutex> config_rlock,
     VIAM_SDK_LOG(debug) << "move: compute_trajectory start " << unix_time;
 
     // Set up TCP velocity limit for UR20 using closed-form Jacobian from URDF kinematic chain.
-    // Constrains the tool center point linear velocity to 1 m/s.
+    // NOTE: The Eigen->xtensor Jacobian extraction below is intentionally duplicated from
+    // tcp_velocity_limit.cpp test. A shared header would couple trajex to the jacobian
+    // library, breaking the intentionally generic tcp_limit interface.
     const auto tcp_limit = [&]() -> std::optional<viam::trajex::totg::trajectory::tcp_limit> {
-        if (model_ != model("ur20")) {
+        if (!jac_model_) {
             return std::nullopt;
         }
 
-        const auto urdf_path = current_state_->resource_root() / "kinematics" / "ur20.urdf";
-        auto jac_model = std::make_shared<jacobian::Model>(
-            jacobian::parseURDF(urdf_path.string()));
-
+        auto jac_data = std::make_shared<jacobian::Data>(*jac_model_);
         return viam::trajex::totg::trajectory::tcp_limit{
+            // 1.0 m/s TCP velocity limit based on UR20 collaborative mode specifications.
+            // See UR20 datasheet for rated tool speed in collaborative operation.
             .max_velocity = 1.0,
-            .jacobian = [jac_model](const xt::xarray<double>& q) -> xt::xarray<double> {
+            .jacobian = [model = jac_model_, data = std::move(jac_data)](const xt::xarray<double>& q) -> xt::xarray<double> {
                 const auto n = static_cast<Eigen::Index>(q.size());
                 const Eigen::Map<const Eigen::VectorXd> q_eigen(q.data(), n);
 
-                jacobian::Data data(*jac_model);
-                jacobian::computeJacobian(*jac_model, q_eigen, data);
+                jacobian::computeJacobian(*model, q_eigen, *data);
 
                 // Extract linear velocity rows (top 3 of 6xN) from closed-form Jacobian
                 xt::xarray<double> result = xt::zeros<double>({3u, static_cast<unsigned>(n)});
                 for (Eigen::Index r = 0; r < 3; ++r) {
                     for (Eigen::Index c = 0; c < n; ++c) {
-                        result(static_cast<std::size_t>(r), static_cast<std::size_t>(c)) = data.J(r, c);
+                        result(static_cast<std::size_t>(r), static_cast<std::size_t>(c)) = data->J(r, c);
                     }
                 }
                 return result;
