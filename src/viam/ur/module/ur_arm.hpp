@@ -103,6 +103,11 @@ class URArm final : public Arm, public Reconfigurable {
     ///
     static constexpr double k_default_waypoint_deduplication_tolerance_rads = 1e-3;
 
+    ///
+    /// Default maximum TCP linear velocity in m/s.
+    ///
+    static constexpr double k_default_tcp_max_velocity_m_per_s = 1.0;
+
     /// @brief Returns the common ModelFamily for all implementations
     static const ModelFamily& model_family();
 

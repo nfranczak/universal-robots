@@ -64,6 +64,7 @@ URArm::state_::state_(private_,
                       std::optional<vector6d_t> max_velocity_limits,
                       std::optional<vector6d_t> max_acceleration_limits,
                       double trajectory_sampling_freq_hz,
+                      double tcp_max_velocity_m_per_s,
                       std::string telemetry_output_path_append_traceid_template,
                       const struct ports_& ports)
     : configured_model_type_{std::move(configured_model_type)},
@@ -85,6 +86,7 @@ URArm::state_::state_(private_,
       max_velocity_limits_(std::move(max_velocity_limits)),
       max_acceleration_limits_(std::move(max_acceleration_limits)),
       trajectory_sampling_freq_hz_(trajectory_sampling_freq_hz),
+      tcp_max_velocity_m_per_s_(tcp_max_velocity_m_per_s),
       telemetry_output_path_append_traceid_template_(std::move(telemetry_output_path_append_traceid_template)) {}
 
 URArm::state_::~state_() {
@@ -159,6 +161,10 @@ std::unique_ptr<URArm::state_> URArm::state_::create(std::string configured_mode
     const double trajectory_sampling_freq_hz =
         find_config_attribute<double>(config, "trajectory_sampling_freq_hz").value_or(URArm::k_default_trajectory_sampling_freq_hz);
 
+    const double tcp_max_velocity_m_per_s =
+        find_config_attribute<double>(config, "tcp_max_velocity_m_per_s")
+            .value_or(URArm::k_default_tcp_max_velocity_m_per_s);
+
     // Parse `telemetry_output_path_append_traceid` — accepts bool (backward compat) or template string with {trace_id}
     const auto telemetry_output_path_append_traceid_template = [&]() -> std::string {
         const auto it = config.attributes().find("telemetry_output_path_append_traceid");
@@ -207,6 +213,7 @@ std::unique_ptr<URArm::state_> URArm::state_::create(std::string configured_mode
                                           std::move(max_velocity_limits),
                                           std::move(max_acceleration_limits),
                                           trajectory_sampling_freq_hz,
+                                          tcp_max_velocity_m_per_s,
                                           telemetry_output_path_append_traceid_template,
                                           ports);
 
@@ -455,6 +462,10 @@ double URArm::state_::get_max_trajectory_duration_secs() const {
 
 double URArm::state_::get_trajectory_sampling_freq_hz() const {
     return trajectory_sampling_freq_hz_;
+}
+
+double URArm::state_::get_tcp_max_velocity_m_per_s() const {
+    return tcp_max_velocity_m_per_s_;
 }
 
 size_t URArm::state_::get_move_epoch() const {

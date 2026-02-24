@@ -35,6 +35,7 @@ class URArm::state_ {
                     std::optional<vector6d_t> max_velocity_limits,
                     std::optional<vector6d_t> max_acceleration_limits,
                     double trajectory_sampling_freq_hz,
+                    double tcp_max_velocity_m_per_s,
                     std::string telemetry_output_path_append_traceid_template,
                     const struct ports_& ports);
     ~state_();
@@ -85,6 +86,7 @@ class URArm::state_ {
 
     double get_max_trajectory_duration_secs() const;
     double get_trajectory_sampling_freq_hz() const;
+    double get_tcp_max_velocity_m_per_s() const;
 
     void clear_pstop() const;
 
@@ -416,6 +418,7 @@ class URArm::state_ {
     const std::optional<vector6d_t> max_velocity_limits_;
     const std::optional<vector6d_t> max_acceleration_limits_;
     const double trajectory_sampling_freq_hz_;
+    const double tcp_max_velocity_m_per_s_;
     const std::string telemetry_output_path_append_traceid_template_;
 
     mutable std::mutex mutex_;

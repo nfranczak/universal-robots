@@ -245,6 +245,11 @@ std::vector<std::string> validate_config_(const ResourceConfig& cfg) {
             boost::str(boost::format("attribute `segmentation_threshold` must be > 0 and <= 0.01, it is: %1%") % *segmentation_threshold));
     }
 
+    auto tcp_max_vel = find_config_attribute<double>(cfg, "tcp_max_velocity_m_per_s");
+    if (tcp_max_vel && *tcp_max_vel <= 0.0) {
+        throw std::invalid_argument("attribute `tcp_max_velocity_m_per_s` must be positive");
+    }
+
     find_config_attribute<bool>(cfg, "prefer_precomputed_accelerations");
 
     // Validate telemetry_output_path is a string if present
@@ -921,14 +926,17 @@ void URArm::move_joint_space_(std::shared_lock<std::shared_mutex> config_rlock,
     // library, breaking the intentionally generic tcp_limit interface.
     const auto tcp_limit = [&]() -> std::optional<viam::trajex::totg::trajectory::tcp_limit> {
         if (!jac_model_) {
+            VIAM_SDK_LOG(debug) << "TCP velocity limiting not available for model " << model_.to_string();
             return std::nullopt;
         }
 
         auto jac_data = std::make_shared<jacobian::Data>(*jac_model_);
         return viam::trajex::totg::trajectory::tcp_limit{
-            // 1.0 m/s TCP velocity limit based on UR20 collaborative mode specifications.
-            // See UR20 datasheet for rated tool speed in collaborative operation.
-            .max_velocity = 1.0,
+            // TCP velocity limit from config attribute `tcp_max_velocity_m_per_s`.
+            // Default 1.0 m/s based on UR20 collaborative mode specifications.
+            .max_velocity = current_state_->get_tcp_max_velocity_m_per_s(),
+            // NOTE: `data` is mutable state reused across calls — this callback is not thread-safe.
+            // TOTG evaluates the Jacobian sequentially; do not parallelize Jacobian evaluations.
             .jacobian = [model = jac_model_, data = std::move(jac_data)](const xt::xarray<double>& q) -> xt::xarray<double> {
                 const auto n = static_cast<Eigen::Index>(q.size());
                 const Eigen::Map<const Eigen::VectorXd> q_eigen(q.data(), n);

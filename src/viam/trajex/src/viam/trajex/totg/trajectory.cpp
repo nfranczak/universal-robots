@@ -240,6 +240,8 @@ auto safe_velocity_limit_derivative(const xt::xarray<double>& q_prime,
 // Returns v_TCP / ||J(q) * f'(s)||, i.e., the maximum path velocity such that
 // the TCP linear velocity does not exceed max_tcp_velocity.
 // Singularity guard: returns infinity when ||J*f'|| < epsilon (TCP not moving).
+// NOTE: The Jacobian callback may hold mutable internal state and is not
+// required to be thread-safe. TOTG evaluates it sequentially.
 arc_velocity compute_tcp_velocity_limit(const xt::xarray<double>& q,
                                                        const xt::xarray<double>& q_prime,
                                                        const trajectory::tcp_limit& tcp,
@@ -251,6 +253,7 @@ arc_velocity compute_tcp_velocity_limit(const xt::xarray<double>& q,
     // Manual 3xN matrix-vector multiply: result = J * q_prime
     const auto rows = J.shape(0);
     const auto cols = J.shape(1);
+    assert(cols == q_prime.size() && "Jacobian column count must match joint DOF");
     double norm_sq = 0.0;
     for (size_t i = 0; i < rows; ++i) {
         double dot = 0.0;
@@ -1227,6 +1230,12 @@ std::optional<switching_point> find_tcp_crossover_switching_point(path::cursor c
 
         const double current_g = compute_g(search_cursor);
 
+        if (!std::isfinite(current_g)) {
+            previous_g = current_g;
+            previous_position = search_position;
+            continue;
+        }
+
         // Check for sign change (crossover)
         if ((previous_g > 0.0 && current_g <= 0.0) || (previous_g < 0.0 && current_g >= 0.0)) {
             // Bisect to find root
@@ -1488,6 +1497,12 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
         }
         if (!opt.tcp->jacobian) {
             throw std::invalid_argument{"tcp.jacobian must be set"};
+        }
+        const auto test_cursor = p.create_cursor();
+        const auto test_J = opt.tcp->jacobian(test_cursor.configuration());
+        if (test_J.shape(1) != p.dof()) {
+            throw std::invalid_argument{
+                "tcp.jacobian must return a matrix with columns matching path DOF"};
         }
     }
 
