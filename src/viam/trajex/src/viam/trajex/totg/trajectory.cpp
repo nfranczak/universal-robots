@@ -53,6 +53,32 @@ struct switching_point {
     return result;
 }
 
+// Minimal RAII scope guard. Calls its function on destruction unless dismissed.
+template <typename F>
+class scope_guard {
+   public:
+    explicit scope_guard(F f) noexcept : f_(std::move(f)) {}
+    ~scope_guard() noexcept {
+        if (active_) {
+            f_();
+        }
+    }
+    void dismiss() noexcept {
+        active_ = false;
+    }
+    scope_guard(const scope_guard&) = delete;
+    scope_guard& operator=(const scope_guard&) = delete;
+
+   private:
+    F f_;
+    bool active_ = true;
+};
+
+template <typename F>
+scope_guard<F> make_scope_guard(F f) noexcept {
+    return scope_guard<F>(std::move(f));
+}
+
 // Computes maximum path velocity (s_dot) from joint velocity and acceleration limits.
 // Two constraints apply: centripetal acceleration from path curvature (eq 31) and
 // direct velocity limits (eq 36). Returns both so caller can take the minimum.
@@ -653,6 +679,10 @@ switching_point find_acceleration_switching_point(path::cursor cursor, const tra
         // Examine the current segment for switching points where the path velocity limit curve, s_dot_max_acc(s),
         // is continuous, but not differentiable, per VII-A Case 2 in the paper (Kunz & Stilman equation 39). These
         // switching points occur on the interior of circular segments for joint extrema where f'_i(s) = 0.
+        //
+        // TODO(RSDK-13450): There is a flaw in this search: it only evaluates the first extremum we find. But if that
+        // fails the check, we don't check the others. Instead, we should gather all the extremal points, sort them,
+        // and then check them in order.
         if (current_segment.is<path::segment::circular>()) {
             std::optional<arc_length> first_extremum;
             arc_velocity first_extremum_velocity{0.0};
@@ -670,32 +700,32 @@ switching_point find_acceleration_switching_point(path::cursor cursor, const tra
                     // continues curving), the acceleration limit curve becomes continuous but non-differentiable,
                     // creating a potential switching point (equation 39, Section VII-A case 2).
                     //
-                    // For circular parameterization f(theta) = c + r*(x*cos(theta) + y*sin(theta)), the tangent
-                    // f'_i(theta) = -x_i*sin(theta) + y_i*cos(theta) is zero when tan(theta) = y_i/x_i.
-                    // Since tan has period pi (not 2*pi), both theta = atan2(y_i, x_i) and theta + pi are
-                    // solutions, giving up to 2*n candidate extrema per circular segment (n = DOF).
+                    // For circular parameterization q(theta) = c + x*cos(theta) + y*sin(theta), the tangent
+                    // q'_i(theta) = -x_i*sin(theta) + y_i*cos(theta) is zero when tan(theta) = y_i/x_i.
+                    // tan has period pi, so the two roots are {atan2(y_i, x_i), atan2(y_i, x_i) + pi}.
+                    // atan2 returns values in (-pi, pi]; adding pi when negative normalizes to [0, pi) so
+                    // both candidates land in [0, 2*pi). Blend arcs have total_angle < pi (enforced by
+                    // path::create), so at most one root per joint falls in range.
                     for (size_t i = 0; i < x.size(); ++i) {
-                        double extremum_angle = std::atan2(y(i), x(i));
+                        auto extremum_angle = std::atan2(y(i), x(i));
                         if (extremum_angle < 0.0) {
-                            extremum_angle += 2.0 * std::numbers::pi;
+                            extremum_angle += std::numbers::pi;
                         }
 
-                        for (const auto angle : {extremum_angle, extremum_angle + std::numbers::pi}) {
-                            if (angle < 0.0 || angle >= total_angle) {
-                                continue;
-                            }
+                        if (extremum_angle >= total_angle) {
+                            continue;
+                        }
 
-                            const arc_length s_local{radius * angle};
-                            const auto s_global = current_segment.start() + s_local;
+                        const arc_length s_local{radius * extremum_angle};
+                        const auto s_global = current_segment.start() + s_local;
 
-                            // Strict < avoids re-checking if cursor is exactly at this extremum
-                            if (s_global < cursor.position() || s_global >= current_segment.end()) {
-                                continue;
-                            }
+                        // Strict < avoids re-checking if cursor is exactly at this extremum
+                        if (s_global < cursor.position()) {
+                            continue;
+                        }
 
-                            if (!first_extremum.has_value() || s_global < *first_extremum) {
-                                first_extremum = s_global;
-                            }
+                        if (!first_extremum || s_global < *first_extremum) {
+                            first_extremum = s_global;
                         }
                     }
 
@@ -1514,6 +1544,21 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
         // Constructor initializes trajectory with initial point at rest (0, 0)
         trajectory traj{std::move(p), std::move(opt)};
 
+        // On any exception, notify the observer with the invalid trajectory before traj is destroyed.
+        auto* observer = traj.options_.observer;
+        auto guard = make_scope_guard([&]() noexcept {
+            if (observer) {
+                std::shared_ptr<trajectory> invalid;
+                try {
+                    invalid = std::make_shared<trajectory>(std::move(traj));
+                } catch (...) {  // NOLINT(bugprone-empty-catch)
+                    // Presumably a `std::bad_alloc`, there isn't much more we can do. We will still call `on_failed` but
+                    // no `trajectory` object will be provided. We will at least get the exception information collected.
+                }
+                observer->on_failed(std::current_exception(), std::move(invalid));
+            }
+        });
+
         // Helper to detect intersection between backward trajectory and forward trajectory in phase plane.
         // Returns index in forward trajectory where intersection occurs, or nullopt if no intersection.
         // Intersection means backward point's s_dot exceeds forward trajectory's interpolated s_dot at same s.
@@ -1710,10 +1755,25 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     }
 
                     auto breach_point = next_point;
-                    next_point = current_point;
-
                     auto breach_s_dot_max_acc = next_s_dot_max_acc;
                     auto breach_s_dot_max_vel = next_s_dot_max_vel;
+
+                    // Reset next to the last known-feasible point (current_point) and recompute
+                    // its path derivatives and velocity limits. next_s_dot_max_acc/vel were for
+                    // the old next_point (now breach_point), not current_point.s.
+                    //
+                    // TODO(RSDK-12769): This is ugly and inefficient. Refactor to avoid all this manual tracking.
+                    next_point = current_point;
+                    path_cursor.seek(next_point.s);
+                    next_q_prime = path_cursor.tangent();
+                    next_q_double_prime = path_cursor.curvature();
+                    auto [next_s_dot_max_acc_2, next_s_dot_max_vel_2] = compute_velocity_limits(next_q_prime,
+                                                                                                next_q_double_prime,
+                                                                                                traj.options_.max_velocity,
+                                                                                                traj.options_.max_acceleration,
+                                                                                                traj.options_.epsilon);
+                    next_s_dot_max_acc = next_s_dot_max_acc_2;
+                    next_s_dot_max_vel = next_s_dot_max_vel_2;
 
                     while (traj.options_.epsilon.wrap(next_point.s) != traj.options_.epsilon.wrap(breach_point.s)) {
                         const phase_point mid = {.s = midpoint(next_point.s, breach_point.s),
@@ -1968,18 +2028,6 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     auto [s_ddot_min, _1] = compute_acceleration_bounds(
                         q_prime, q_double_prime, current_point.s_dot, traj.options_.max_acceleration, traj.options_.epsilon);
 
-                    // Minimum acceleration must be negative to produce backward motion (decreasing s)
-                    // Allow small tolerance for numerical precision at near-zero acceleration points
-                    if (s_ddot_min >= -traj.options_.epsilon) {
-                        if (s_ddot_min > traj.options_.epsilon) {
-                            // Clearly positive - this is an error
-                            throw std::runtime_error{"TOTG algorithm error: backward integration requires negative minimum acceleration"};
-                        }
-                        // Probably numerical noise, just clamp to zero. Backward integration will
-                        // make progress as long as s_dot is non-zero.
-                        return arc_acceleration{0.0};
-                    }
-
                     return s_ddot_min;
                 }();
 
@@ -2042,6 +2090,17 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     // makes this kinematically consistent.
 
                     auto& last_forward_point = traj.integration_points_.back();
+
+                    // If the first backward step already crossed the forward trajectory, backwards_points
+                    // is empty and the switching point itself was never recorded. Push it now so the
+                    // splice logic below has something to work with and the switching point ends up in
+                    // integration_points_ where forward integration expects it.
+                    if (backwards_points.empty()) {
+                        backwards_points.push_back({.time = trajectory::seconds{0.0},
+                                                    .s = current_point.s,
+                                                    .s_dot = current_point.s_dot,
+                                                    .s_ddot = s_ddot_desired});
+                    }
 
                     // Access backwards points in reverse order (first backward point is closest to splice).
                     const auto backwards_points_reversed = std::ranges::reverse_view(std::as_const(backwards_points));
@@ -2171,6 +2230,7 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
             sp = integrate_backwards_from(integrate_forward_from(sp));
         }
 
+        guard.dismiss();
         return traj;
     } else {
         // Test path: validate provided integration points
