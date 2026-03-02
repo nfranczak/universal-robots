@@ -817,4 +817,84 @@ BOOST_AUTO_TEST_CASE(RSDK_13338_gp12_switching_point_above_forward) {
     validate_tcp_velocity(traj, *tcp_opts.tcp);
 }
 
+// GP12 344-waypoint trajectory with high joint limits: reproduces a "backward
+// integration exceeded limit curve" crash. With speed=3.14 rad/s and accel=5.0
+// rad/s², the TCP constraint (1.2 m/s) is much more binding, creating steep
+// limit curve dips that backward integration can exceed.
+BOOST_AUTO_TEST_CASE(RSDK_13338_gp12_backward_exceeded_limit) {
+    const auto urdf_path =
+        std::filesystem::path(__FILE__).parent_path() / "../../../../../../../kinematics/gp12.urdf";
+    BOOST_REQUIRE_MESSAGE(std::filesystem::exists(urdf_path), "GP12 URDF not found at " << urdf_path);
+
+    auto jac_model = std::make_shared<jacobian::Model>(
+        jacobian::parseURDF(urdf_path.string()));
+
+    auto jac_data = std::make_shared<jacobian::Data>(*jac_model);
+
+    auto jac_fn = [jac_model, jac_data](const xt::xarray<double>& q) -> xt::xarray<double> {
+        const auto n = static_cast<Eigen::Index>(q.size());
+        const Eigen::Map<const Eigen::VectorXd> q_eigen(q.data(), n);
+
+        jacobian::computeJacobian(*jac_model, q_eigen, *jac_data);
+
+        xt::xarray<double> result = xt::zeros<double>({3u, static_cast<unsigned>(n)});
+        for (Eigen::Index r = 0; r < 3; ++r) {
+            for (Eigen::Index c = 0; c < n; ++c) {
+                result(static_cast<std::size_t>(r), static_cast<std::size_t>(c)) = jac_data->J(r, c);
+            }
+        }
+        return result;
+    };
+
+    const auto json_path =
+        std::filesystem::path(__FILE__).parent_path() / "data/gp12_backward_exceeded_limit.json";
+    BOOST_REQUIRE_MESSAGE(std::filesystem::exists(json_path), "Trajectory JSON not found at " << json_path);
+
+    std::ifstream json_file(json_path);
+    BOOST_REQUIRE(json_file.is_open());
+
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    BOOST_REQUIRE(Json::parseFromStream(builder, json_file, &root, &errors));
+
+    const auto& waypoints_json = root["waypoints_rad"];
+    BOOST_REQUIRE(!waypoints_json.empty());
+
+    const auto num_waypoints = waypoints_json.size();
+    const auto num_joints = waypoints_json[0].size();
+    BOOST_REQUIRE_EQUAL(num_joints, 6u);
+
+    xt::xarray<double> waypoints = xt::zeros<double>(
+        {static_cast<size_t>(num_waypoints), static_cast<size_t>(num_joints)});
+    for (Json::ArrayIndex i = 0; i < num_waypoints; ++i) {
+        for (Json::ArrayIndex j = 0; j < num_joints; ++j) {
+            waypoints(i, j) = waypoints_json[i][j].asDouble();
+        }
+    }
+
+    const auto p = path::create(waypoints, path::options{}.set_max_blend_deviation(0.1));
+
+    // Exact configuration from hardware — higher limits than previous test
+    const double speed = 3.14;
+    const double accel = 5.0;
+    const double tcp_max_vel = 1.2;
+
+    const xt::xarray<double> max_vel = {speed, speed, speed, speed, speed, speed};
+    const xt::xarray<double> max_acc = {accel, accel, accel, accel, accel, accel};
+
+    trajectory::options tcp_opts{
+        .max_velocity = max_vel,
+        .max_acceleration = max_acc,
+        .tcp = trajectory::tcp_limit{
+            .max_velocity = tcp_max_vel,
+            .jacobian = jac_fn,
+        },
+    };
+
+    const auto traj = trajectory::create(p, tcp_opts);
+    validate_trajectory_basics(traj, 0.5);
+    validate_tcp_velocity(traj, *tcp_opts.tcp);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

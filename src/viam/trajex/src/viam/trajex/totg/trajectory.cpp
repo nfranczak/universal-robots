@@ -2065,7 +2065,7 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                 // TODO(RSDK-12981): There's no guarantee that the candidate we select here by going
                 // backwards with `s_ddot_to_use` as determined at the switching point would then
                 // integrate forwards from the candidate to the switching point.
-                const auto next_point =
+                auto next_point =
                     euler_step(current_point.s, current_point.s_dot, s_ddot_desired, -traj.options_.delta, traj.options_.epsilon);
 
                 // TODO: Do we need to avoid integrating across segment boundaries here too?
@@ -2234,10 +2234,14 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     throw std::runtime_error{"TOTG algorithm error: velocity limit curve is non-positive during backward integration"};
                 }
 
-                // `Divergent Behavior 3`: Candidate exceeding limit curve is an algorithm error - trajectory is
-                // infeasible. Being at the limit (within epsilon) is allowed - only exceeding it is rejected.
-                if (traj.options_.epsilon.wrap(next_point.s_dot) > traj.options_.epsilon.wrap(s_dot_limit)) {
-                    throw std::runtime_error{"TOTG algorithm error: backward integration exceeded limit curve - trajectory is infeasible"};
+                // `Divergent Behavior 3`: Backward integration must stay at or below the limit curve.
+                // With TCP velocity limiting, the combined limit curve (min of joint and TCP) can
+                // vary with configuration, so a trajectory starting below the acceleration limit
+                // curve at the switching point may cross the TCP velocity limit after a few Euler
+                // steps. Clamp to the limit curve rather than throwing — the overshoot is bounded
+                // by the Euler step size and the clamping keeps the trajectory feasible.
+                if (next_point.s_dot > s_dot_limit) {
+                    next_point.s_dot = s_dot_limit;
                 }
 
                 // The point is feasible, so append it to the backwards trajectory points. Note that the timestamps
