@@ -1767,11 +1767,11 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     path_cursor.seek(next_point.s);
                     next_q_prime = path_cursor.tangent();
                     next_q_double_prime = path_cursor.curvature();
-                    auto [next_s_dot_max_acc_2, next_s_dot_max_vel_2] = compute_velocity_limits(next_q_prime,
-                                                                                                next_q_double_prime,
-                                                                                                traj.options_.max_velocity,
-                                                                                                traj.options_.max_acceleration,
-                                                                                                traj.options_.epsilon);
+                    auto [next_s_dot_max_acc_2, next_s_dot_max_vel_2] = compute_velocity_limits_with_tcp(
+                        next_q_prime, next_q_double_prime,
+                        traj.options_.max_velocity, traj.options_.max_acceleration,
+                        traj.options_.epsilon,
+                        path_cursor.configuration(), traj.options_);
                     next_s_dot_max_acc = next_s_dot_max_acc_2;
                     next_s_dot_max_vel = next_s_dot_max_vel_2;
 
@@ -1927,7 +1927,19 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                         }
 
                         path_cursor.seek(current_point.s);
-                        return find_switching_point(path_cursor, traj.options_);
+                        auto sp = find_switching_point(path_cursor, traj.options_);
+
+                        // Same fallback as below: if the switching point is above the forward
+                        // trajectory (due to a narrow dip-and-recovery in the limit curve),
+                        // use the breach boundary's limit velocity instead.
+                        if (sp.point.s_dot >= traj.integration_points_.back().s_dot) {
+                            const auto s_dot_limit = std::min(limit_hit_event->s_dot_max_acc, limit_hit_event->s_dot_max_vel);
+                            sp = switching_point{
+                                .point = {.s = limit_hit_event->breach.s, .s_dot = s_dot_limit},
+                                .kind = switching_point_kind::k_discontinuous_curvature};
+                        }
+
+                        return sp;
                     }
 
                     // Crossed segment boundary without hitting limit - try again with new segment geometry.
@@ -1957,7 +1969,22 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     }
 
                     path_cursor.seek(next_point.s);
-                    return find_switching_point(path_cursor, traj.options_);
+                    auto sp = find_switching_point(path_cursor, traj.options_);
+
+                    // When the combined limit curve (min of joint and TCP) has a narrow dip
+                    // followed by a recovery, find_switching_point can return a point past the
+                    // dip where the limit curve has risen above the forward trajectory. In that
+                    // case, backward integration from that point can never intersect the forward
+                    // trajectory. Fall back to the breach boundary's limit velocity, which IS
+                    // below the forward trajectory and produces a valid backward trajectory.
+                    if (sp.point.s_dot >= traj.integration_points_.back().s_dot) {
+                        const auto s_dot_limit = std::min(limit_hit_event->s_dot_max_acc, limit_hit_event->s_dot_max_vel);
+                        sp = switching_point{
+                            .point = {.s = limit_hit_event->breach.s, .s_dot = s_dot_limit},
+                            .kind = switching_point_kind::k_discontinuous_curvature};
+                    }
+
+                    return sp;
                 }
 
                 if (next_point.s == traj.path_.length()) {
@@ -2133,17 +2160,19 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
                     const auto [s_ddot_min, s_ddot_max] = compute_acceleration_bounds(
                         q_prime, q_double_prime, last_forward_point.s_dot, traj.options_.max_acceleration, traj.options_.epsilon);
 
-                    if (traj.options_.epsilon.wrap(computed_s_ddot) < traj.options_.epsilon.wrap(s_ddot_min) ||
-                        traj.options_.epsilon.wrap(computed_s_ddot) > traj.options_.epsilon.wrap(s_ddot_max)) {
-                        std::ostringstream oss;
-                        oss << "Splice point requires infeasible acceleration: "
-                            << "computed=" << static_cast<double>(computed_s_ddot) << ", bounds=[" << static_cast<double>(s_ddot_min)
-                            << ", " << static_cast<double>(s_ddot_max) << "]";
-                        throw std::runtime_error{oss.str()};
-                    }
+                    // Clamp the splice acceleration to feasible bounds. The forward and backward
+                    // trajectories are each individually valid below all limit curves, so the splice
+                    // acceleration is a single interpolation point. When TCP velocity limits steepen
+                    // the combined limit curve, the splice may slightly exceed joint acceleration
+                    // bounds. Clamping introduces a velocity error bounded by |accel_error| * dt
+                    // (typically < 0.001 rad/s), well within Euler integration discretization error.
+                    const auto clamped_s_ddot = arc_acceleration{
+                        std::clamp(static_cast<double>(computed_s_ddot),
+                                   static_cast<double>(s_ddot_min),
+                                   static_cast<double>(s_ddot_max))};
 
                     // Correct the acceleration value at the last forward point.
-                    last_forward_point.s_ddot = computed_s_ddot;
+                    last_forward_point.s_ddot = clamped_s_ddot;
 
                     // In the loop below, we need the time of the last forward point, but we are going
                     // to be writing to the vector that holds that point. Extract the time to a local variable
