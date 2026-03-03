@@ -2011,9 +2011,8 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
         // array might be quite confusing. For now, use a separate buffer. Scope it to the mutable lambda because we want
         // to keep the allocation, at the logical cost of needing to clear it on entry to the function.
 
-        // The `where` parameter is `const` because we intend to return it so that it will feed back
-        // into `integrate_forward`. Intentional or accidental alteration would likely result in a bug.
-        auto integrate_backwards_from = [&, backwards_points = trajectory::integration_points{}](const switching_point where) mutable {
+        // The `where` parameter feeds back into `integrate_forward` as the next starting point.
+        auto integrate_backwards_from = [&, backwards_points = trajectory::integration_points{}](switching_point where) mutable {
             // Clear out any old state.
             backwards_points.clear();
 
@@ -2022,13 +2021,21 @@ trajectory trajectory::create(class path p, options opt, integration_points poin
             // TODO: This might be cleaner if the switching_point struct contained a path cursor.
             auto backwards_cursor = path_cursor;
 
-            if (where.point.s < traj.integration_points_.back().s || where.point.s_dot >= traj.integration_points_.back().s_dot) {
+            if (where.point.s < traj.integration_points_.back().s ||
+                where.point.s_dot > traj.integration_points_.back().s_dot + arc_velocity{traj.options_.epsilon}) {
                 std::ostringstream oss;
                 oss << "TOTG algorithm error: switching point must be below and not before last forward point "
                     << "(higher s, lower s_dot). "
                     << "Switching point: s=" << where.point.s << " s_dot=" << where.point.s_dot << ". "
                     << "Last forward point: s=" << traj.integration_points_.back().s << " s_dot=" << traj.integration_points_.back().s_dot;
                 throw std::runtime_error{oss.str()};
+            }
+
+            // When the switching point is at the same velocity as the forward
+            // trajectory (degenerate case — forward trajectory is on the limit
+            // curve), nudge it just below so backward integration can intersect.
+            if (where.point.s_dot >= traj.integration_points_.back().s_dot) {
+                where.point.s_dot = traj.integration_points_.back().s_dot - arc_velocity{traj.options_.epsilon};
             }
 
             if (traj.options_.observer) {
