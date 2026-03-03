@@ -164,6 +164,8 @@ find_package(Boost CONFIG REQUIRED
     headers
 )
 
+add_subdirectory(third_party/jacobian)
+
 FetchContent_Declare(
   trajex
   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/viam/trajex
@@ -171,8 +173,6 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(trajex)
 
 enable_testing()
-
-add_subdirectory(third_party/jacobian)
 
 #
 # Declare targets

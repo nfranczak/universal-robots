@@ -10,6 +10,10 @@
 #include <viam/sdk/resource/reconfigurable.hpp>
 #include <viam/sdk/services/mlmodel.hpp>
 
+namespace jacobian {
+struct Model;
+}  // namespace jacobian
+
 namespace viam::trajex {
 
 class trajex_mlmodel_service final : public ::viam::sdk::MLModelService, public ::viam::sdk::Reconfigurable {
@@ -28,10 +32,13 @@ class trajex_mlmodel_service final : public ::viam::sdk::MLModelService, public 
     struct config {
         std::vector<std::string> generator_sequence = {"totg", "legacy"};
         bool segment_for_totg = true;
+        std::optional<std::string> urdf_file_path;
+        std::optional<double> tcp_max_velocity_m_per_s;
     };
 
     mutable std::shared_mutex config_mutex_;
     config config_;
+    std::shared_ptr<jacobian::Model> jac_model_;
 };
 
 }  // namespace viam::trajex

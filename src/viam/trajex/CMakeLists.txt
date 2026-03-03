@@ -22,6 +22,10 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
   set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0")
 endif()
 
+# GNUInstallDirs must be included before RPATH setup so that
+# CMAKE_INSTALL_BINDIR and CMAKE_INSTALL_LIBDIR are defined.
+include(GNUInstallDirs)
+
 # Configure RPATH for relocatable installs (standalone builds only)
 if(TRAJEX_STANDALONE_BUILD)
   set(CMAKE_BUILD_WITH_INSTALL_RPATH false)
@@ -213,11 +217,17 @@ target_include_directories(viam-trajex-service
     $<INSTALL_INTERFACE:include>
 )
 
+if(NOT TARGET jacobian)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/jacobian jacobian)
+endif()
+
 target_link_libraries(viam-trajex-service
   PUBLIC
     Eigen3::Eigen
     viam::trajex::totg
     viam::trajex::totg-legacy
+  PRIVATE
+    jacobian
 )
 
 apply_wall_werror(viam-trajex-service)
@@ -347,14 +357,13 @@ add_test(
 # Installation
 #
 
-include(GNUInstallDirs)
-
 # Always install libraries (UR uses service library for colinearization)
 install(
   TARGETS
   viam-trajex-totg-legacy
   viam-trajex-totg
   viam-trajex-service
+  jacobian
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
