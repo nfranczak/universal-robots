@@ -38,6 +38,10 @@
 #include <viam/sdk/registry/registry.hpp>
 #include <viam/sdk/resource/resource.hpp>
 
+#include <jacobian.hpp>
+#include <model.hpp>
+#include <urdf_parser.hpp>
+
 #include <third_party/trajectories/Path.h>
 #include <third_party/trajectories/Trajectory.h>
 
@@ -570,12 +574,12 @@ void URArm::move_to_joint_positions(const std::vector<double>& positions, const 
     const auto waypoint_deg = xt::adapt(positions.data(), positions.size(), xt::no_ownership(), shape);
     const xt::xarray<double> waypoint_rad = viam::trajex::degrees_to_radians(waypoint_deg);
 
-    move_joint_space_(std::move(rlock), waypoint_rad, MoveOptions{}, unix_time);
+    move_joint_space_(std::move(rlock), waypoint_rad, MoveOptions{}, {}, unix_time);
 }
 
 void URArm::move_through_joint_positions(const std::vector<std::vector<double>>& positions,
                                          const MoveOptions& options,
-                                         const viam::sdk::ProtoStruct&) {
+                                         const viam::sdk::ProtoStruct& extra) {
     std::shared_lock rlock{config_mutex_};
     check_configured_(rlock);
     const auto unix_time = unix_time_iso8601();
@@ -591,7 +595,7 @@ void URArm::move_through_joint_positions(const std::vector<std::vector<double>>&
         xt::view(waypoints_rad, i, xt::all()) = viam::trajex::degrees_to_radians(row_deg);
     }
 
-    move_joint_space_(std::move(rlock), waypoints_rad, options, unix_time);
+    move_joint_space_(std::move(rlock), waypoints_rad, options, extra, unix_time);
 }
 
 pose URArm::get_end_position(const ProtoStruct&) {
@@ -860,6 +864,7 @@ void URArm::move_tool_space_(std::shared_lock<std::shared_mutex> config_rlock, p
 void URArm::move_joint_space_(std::shared_lock<std::shared_mutex> config_rlock,
                               const xt::xarray<double>& waypoints,
                               const MoveOptions& options,
+                              const viam::sdk::ProtoStruct& extra,
                               const std::string& unix_time) {
     auto our_config_rlock = std::move(config_rlock);
 
@@ -892,6 +897,43 @@ void URArm::move_joint_space_(std::shared_lock<std::shared_mutex> config_rlock,
         acceleration_limits_data = current_state_->clamp_acceleration_limits(acceleration_limits_data);
     }
 
+    // Build TCP velocity limit if requested via extra and URDF is available
+    std::optional<viam::trajex::totg::trajectory::tcp_limit> tcp_limit;
+    {
+        auto tcp_it = extra.find("tcp_max_speed");
+        if (tcp_it != extra.end()) {
+            const auto* val = tcp_it->second.get<double>();
+            if (!val || *val <= 0.0) {
+                throw std::invalid_argument("extra.tcp_max_speed must be a positive number");
+            }
+
+            const auto& jac_model = current_state_->get_jacobian_model();
+            if (!jac_model) {
+                throw std::invalid_argument("TCP speed limiting is not available for this arm model (no URDF)");
+            }
+
+            auto jac_data = std::make_shared<jacobian::Data>(*jac_model);
+            tcp_limit = viam::trajex::totg::trajectory::tcp_limit{
+                .max_velocity = *val,
+                .jacobian = [model = jac_model, data = std::move(jac_data)](
+                                 const xt::xarray<double>& q) -> xt::xarray<double> {
+                    const auto n = static_cast<Eigen::Index>(q.size());
+                    const Eigen::Map<const Eigen::VectorXd> q_eigen(q.data(), n);
+                    jacobian::computeJacobian(*model, q_eigen, *data);
+                    xt::xarray<double> result = xt::zeros<double>({3u, static_cast<unsigned>(n)});
+                    for (Eigen::Index r = 0; r < 3; ++r) {
+                        for (Eigen::Index c = 0; c < n; ++c) {
+                            result(static_cast<std::size_t>(r), static_cast<std::size_t>(c)) = data->J(r, c);
+                        }
+                    }
+                    return result;
+                },
+            };
+
+            VIAM_SDK_LOG(info) << "TCP velocity limiting enabled: max_speed=" << *val << " m/s";
+        }
+    }
+
     struct segment_accumulator {
         std::optional<trajectory_samples> samples;
         double total_duration = 0.0;
@@ -908,6 +950,7 @@ void URArm::move_joint_space_(std::shared_lock<std::shared_mutex> config_rlock,
         .acceleration_limits = xt::adapt(acceleration_limits_data),
         .path_blend_tolerance = current_state_->get_path_tolerance_delta_rads(),
         .colinearization_ratio = current_state_->get_path_colinearization_ratio(),
+        .tcp = std::move(tcp_limit),
     });
 
     planner

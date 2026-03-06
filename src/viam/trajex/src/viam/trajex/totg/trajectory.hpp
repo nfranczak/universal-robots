@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <memory>
+#include <optional>
 
 #if __has_include(<xtensor/containers/xarray.hpp>)
 #include <xtensor/containers/xarray.hpp>
@@ -68,6 +70,42 @@ class trajectory {
     class integration_event_observer;
 
     ///
+    /// TCP (tool center point) velocity limit.
+    ///
+    /// Constrains the Cartesian linear velocity of the tool center point.
+    /// The Jacobian maps joint velocities to TCP linear velocity, and the
+    /// constraint is folded into the velocity limit curve transparently.
+    ///
+    /// @note The jacobian callback is invoked sequentially during TOTG integration.
+    ///       It need not be thread-safe, but must be safe to call repeatedly with
+    ///       different q values. The callback may hold mutable internal state (e.g.,
+    ///       pre-allocated workspace for Jacobian computation).
+    ///
+    /// @warning When this struct is copied, the std::function is copied. If the
+    ///          callback captures mutable workspace via shared_ptr (e.g., a shared
+    ///          Jacobian data buffer), all copies share that workspace. Ensure all
+    ///          copies are used sequentially, never concurrently.
+    ///
+    struct tcp_limit {
+        ///
+        /// Maximum TCP linear velocity in m/s. Must be positive and finite.
+        ///
+        double max_velocity;
+
+        ///
+        /// Returns the 3xN linear velocity Jacobian as an xtensor array.
+        ///
+        /// The Jacobian maps joint velocities to TCP linear velocity:
+        ///   v_TCP = J(q) * q_dot
+        /// where J is 3xN (3 Cartesian linear velocity components, N joints).
+        /// Must return a matrix with exactly 3 rows and N columns (matching the
+        /// joint DOF). The caller is responsible for bridging from Eigen or other
+        /// representations.
+        ///
+        std::function<xt::xarray<double>(const xt::xarray<double>&)> jacobian;
+    };
+
+    ///
     /// Options for trajectory generation via TOTG algorithm.
     ///
     struct options {
@@ -106,6 +144,14 @@ class trajectory {
         class epsilon epsilon{k_default_epsilon};
 
         ///
+        /// Optional TCP (tool center point) velocity limit.
+        ///
+        /// When set, adds a TCP velocity constraint that is folded into the
+        /// velocity limit curve: s_dot_max_vel(s) = min(joint, TCP).
+        ///
+        std::optional<struct tcp_limit> tcp{};
+
+        ///
         /// Observer for integration events (optional).
         ///
         /// Receives notifications about algorithm phases: forward/backward integration,
@@ -126,6 +172,7 @@ class trajectory {
         k_nondifferentiable_extremum,    ///< Acceleration case 2 (Eq 39): f'_i(s) = 0
         k_velocity_escape,               ///< Velocity case 1 (Eq 40): can escape below velocity curve
         k_discontinuous_velocity_limit,  ///< Equations 41-42: velocity limit discontinuous
+        k_tcp_crossover,                 ///< TCP/joint velocity limit crossover
         k_path_end,                      ///< Natural termination at path end
     };
 
@@ -493,12 +540,19 @@ class trajectory::integration_event_observer : public trajectory::integration_ob
 
     void on_trajectory_extended(const trajectory& traj, splice_event event) final;
 
+    /// Default no-op: failure is propagated via exceptions, not events.
+    /// Subclasses may override to capture diagnostics.
+    void on_failed(std::exception_ptr error, std::shared_ptr<const trajectory> invalid) noexcept override;
+
     ///
     /// Called for all integration events with event type as variant.
     ///
     /// Override this method to handle all event types uniformly. All specific
     /// event callbacks (on_started_forward_integration, on_hit_limit_curve, etc.)
     /// are marked final and forward to this method.
+    ///
+    /// @note on_failed is NOT forwarded through on_event — it has a separate
+    /// default no-op implementation. Override on_failed directly if needed.
     ///
     /// @param traj Trajectory being integrated
     /// @param ev Event variant containing one of the event types

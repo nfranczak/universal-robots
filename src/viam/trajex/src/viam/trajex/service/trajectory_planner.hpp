@@ -35,6 +35,7 @@ struct trajectory_planner_base {
         double path_blend_tolerance = 0.0;
         std::optional<double> colinearization_ratio;
         bool segment_trajex = true;
+        std::optional<totg::trajectory::tcp_limit> tcp;
     };
 
     ///
@@ -71,6 +72,11 @@ struct trajectory_planner_base {
 /// into the receiver. The decider receives both receivers and picks the winner.
 ///
 /// Single-use: construct, configure via builder methods, call execute(), discard.
+///
+/// @note Not thread-safe. Segments are processed sequentially. The optional
+/// `tcp_limit` in config may hold mutable state in its Jacobian callback that
+/// is shared across per-segment copies — concurrent segment processing would
+/// require per-segment Jacobian data allocation.
 ///
 /// @tparam Receiver Default-constructible type for accumulating per-segment results
 ///
@@ -295,6 +301,7 @@ class trajectory_planner : public trajectory_planner_base {
                 totg::trajectory::options topts;
                 topts.max_velocity = config_.velocity_limits;
                 topts.max_acceleration = config_.acceleration_limits;
+                topts.tcp = config_.tcp;
 
                 auto start = std::chrono::steady_clock::now();
                 auto traj = totg::trajectory::create(std::move(p), std::move(topts));

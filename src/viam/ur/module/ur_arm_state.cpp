@@ -17,6 +17,8 @@
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/algorithm.hpp>
 
+#include <urdf_parser.hpp>
+
 #include <viam/sdk/log/logging.hpp>
 #include <viam/sdk/rpc/grpc_context_observer.hpp>
 
@@ -209,6 +211,32 @@ std::unique_ptr<URArm::state_> URArm::state_::create(std::string configured_mode
                                           trajectory_sampling_freq_hz,
                                           telemetry_output_path_append_traceid_template,
                                           ports);
+
+    // Parse URDF for Jacobian computation (TCP velocity limiting).
+    // Not all models have URDFs; TCP limiting is unavailable for those that don't.
+    {
+        const auto model_string = state->configured_model_type_;
+        // configured_model_type_ is "UR3", "UR5", "UR20" — map to URDF filename
+        const auto urdf_model_name = [&]() -> std::string {
+            if (model_string == "UR3") return "ur3e";
+            if (model_string == "UR5") return "ur5e";
+            if (model_string == "UR20") return "ur20";
+            return {};
+        }();
+
+        if (!urdf_model_name.empty()) {
+            const auto urdf_path = state->resource_root_ / "kinematics" / (urdf_model_name + ".urdf");
+            if (std::filesystem::exists(urdf_path)) {
+                try {
+                    state->jacobian_model_ = std::make_shared<jacobian::Model>(jacobian::parseURDF(urdf_path.string()));
+                    VIAM_SDK_LOG(info) << "Loaded URDF for TCP velocity limiting: " << urdf_path;
+                } catch (const std::exception& e) {
+                    VIAM_SDK_LOG(warn) << "Failed to parse URDF at " << urdf_path << ": " << e.what()
+                                       << " — TCP velocity limiting will be unavailable";
+                }
+            }
+        }
+    }
 
     state->set_velocity_limits(parse_and_validate_joint_limits(config, "speed_degs_per_sec"));
     state->set_acceleration_limits(parse_and_validate_joint_limits(config, "acceleration_degs_per_sec2"));
@@ -455,6 +483,10 @@ double URArm::state_::get_max_trajectory_duration_secs() const {
 
 double URArm::state_::get_trajectory_sampling_freq_hz() const {
     return trajectory_sampling_freq_hz_;
+}
+
+const std::shared_ptr<jacobian::Model>& URArm::state_::get_jacobian_model() const {
+    return jacobian_model_;
 }
 
 size_t URArm::state_::get_move_epoch() const {

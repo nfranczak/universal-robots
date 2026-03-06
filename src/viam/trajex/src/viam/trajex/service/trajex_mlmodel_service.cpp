@@ -1,6 +1,7 @@
 #include <viam/trajex/service/trajex_mlmodel_service.hpp>
 
 #include <algorithm>
+#include <functional>
 #include <iterator>
 #include <optional>
 #include <ranges>
@@ -20,6 +21,10 @@
 #endif
 
 #include <viam/sdk/log/logging.hpp>
+
+#include "jacobian.hpp"
+#include "model.hpp"
+#include "urdf_parser.hpp"
 
 #include <viam/trajex/service/sampling_utils.hpp>
 #include <viam/trajex/service/trajectory_planner.hpp>
@@ -41,6 +46,7 @@ struct service_result {
     std::vector<double> configurations;
     std::vector<double> velocities;
     std::optional<std::vector<double>> accelerations;
+    std::vector<double> tcp_velocities;  // ||J(q) * q_dot|| per sample
     double total_duration = 0.0;
 };
 
@@ -84,6 +90,37 @@ double get_scalar_double(const trajex_mlmodel_service::named_tensor_views& input
 }
 
 }  // namespace
+
+std::shared_ptr<jacobian::Model> trajex_mlmodel_service::get_or_parse_urdf(const std::string& urdf_xml) {
+    const std::lock_guard lock{urdf_cache_mutex_};
+
+    // Check cache (keyed on full content string — no hash collisions)
+    auto it = urdf_cache_map_.find(urdf_xml);
+    if (it != urdf_cache_map_.end()) {
+        // Move to front (most recently used)
+        urdf_cache_list_.splice(urdf_cache_list_.begin(), urdf_cache_list_, it->second);
+        return it->second->model;
+    }
+
+    // Parse new model. For typical 6-DOF robot URDFs this is ~microseconds.
+    auto model = std::make_shared<jacobian::Model>(jacobian::parseURDFFromString(urdf_xml));
+
+    // Evict least recently used if at capacity
+    if (urdf_cache_list_.size() >= k_urdf_cache_capacity) {
+        auto& back = urdf_cache_list_.back();
+        VIAM_SDK_LOG(debug) << "URDF cache evicting model '" << back.model->name
+                            << "' (" << back.content.size() << " bytes, capacity=" << k_urdf_cache_capacity << ")";
+        urdf_cache_map_.erase(back.content);
+        urdf_cache_list_.pop_back();
+    }
+
+    urdf_cache_list_.push_front({urdf_xml, model});
+    // Key is a string_view into the list node's content — pointer-stable because
+    // std::list never moves its nodes.
+    urdf_cache_map_.emplace(std::string_view{urdf_cache_list_.front().content}, urdf_cache_list_.begin());
+
+    return model;
+}
 
 std::vector<std::string> trajex_mlmodel_service::validate(const vsdk::ResourceConfig& cfg) {
     std::vector<std::string> errors;
@@ -160,12 +197,37 @@ void trajex_mlmodel_service::reconfigure(const vsdk::Dependencies&, const vsdk::
 }
 
 std::shared_ptr<trajex_mlmodel_service::named_tensor_views> trajex_mlmodel_service::infer(const named_tensor_views& inputs,
-                                                                                          const vsdk::ProtoStruct&) {
+                                                                                          const vsdk::ProtoStruct& extra) {
     // Snapshot config under the read lock, then release
     config local_config;
     {
         const std::shared_lock lock{config_mutex_};
         local_config = config_;
+    }
+
+    // Extract TCP parameters from extra field (per-call)
+    std::shared_ptr<jacobian::Model> local_jac_model;
+    std::optional<double> tcp_max_velocity;
+
+    auto urdf_it = extra.find("urdf_xml");
+    if (urdf_it != extra.end()) {
+        const auto* urdf_xml = urdf_it->second.get<std::string>();
+        if (!urdf_xml || urdf_xml->empty()) {
+            throw std::invalid_argument("extra.urdf_xml must be a non-empty string");
+        }
+        local_jac_model = get_or_parse_urdf(*urdf_xml);
+    }
+
+    auto tcp_vel_it = extra.find("tcp_max_velocity_m_per_s");
+    if (tcp_vel_it != extra.end()) {
+        const auto* val = tcp_vel_it->second.get<double>();
+        if (!val || *val <= 0.0) {
+            throw std::invalid_argument("extra.tcp_max_velocity_m_per_s must be a positive number");
+        }
+        if (!local_jac_model) {
+            throw std::invalid_argument("extra.tcp_max_velocity_m_per_s requires extra.urdf_xml to be set");
+        }
+        tcp_max_velocity = *val;
     }
 
     // Parse inputs
@@ -204,6 +266,28 @@ std::shared_ptr<trajex_mlmodel_service::named_tensor_views> trajex_mlmodel_servi
     xt::xarray<double> velocity_limits(velocity_limits_view);
     xt::xarray<double> acceleration_limits(acceleration_limits_view);
 
+    // Build TCP limit if jacobian model and tcp velocity are provided
+    std::optional<totg::trajectory::tcp_limit> tcp_limit;
+    if (local_jac_model && tcp_max_velocity) {
+        auto jac_data = std::make_shared<jacobian::Data>(*local_jac_model);
+        tcp_limit = totg::trajectory::tcp_limit{
+            .max_velocity = *tcp_max_velocity,
+            .jacobian = [model = local_jac_model, data = std::move(jac_data)](
+                             const xt::xarray<double>& q) -> xt::xarray<double> {
+                const auto n = static_cast<Eigen::Index>(q.size());
+                const Eigen::Map<const Eigen::VectorXd> q_eigen(q.data(), n);
+                jacobian::computeJacobian(*model, q_eigen, *data);
+                xt::xarray<double> result = xt::zeros<double>({3u, static_cast<unsigned>(n)});
+                for (Eigen::Index r = 0; r < 3; ++r) {
+                    for (Eigen::Index c = 0; c < n; ++c) {
+                        result(static_cast<std::size_t>(r), static_cast<std::size_t>(c)) = data->J(r, c);
+                    }
+                }
+                return result;
+            },
+        };
+    }
+
     // Build the planner
     auto planner = trajectory_planner<service_result>({
         .velocity_limits = std::move(velocity_limits),
@@ -211,6 +295,7 @@ std::shared_ptr<trajex_mlmodel_service::named_tensor_views> trajex_mlmodel_servi
         .path_blend_tolerance = path_tolerance,
         .colinearization_ratio = colinearization_ratio,
         .segment_trajex = local_config.segment_for_totg,
+        .tcp = std::move(tcp_limit),
     });
 
     planner
@@ -230,6 +315,7 @@ std::shared_ptr<trajex_mlmodel_service::named_tensor_views> trajex_mlmodel_servi
         if (algo == "totg") {
             planner.with_trajex([&, dof](service_result& acc, const totg::waypoint_accumulator&, const totg::trajectory& traj, auto) {
                 acc.dof = dof;
+                const double time_offset = acc.total_duration;
                 acc.total_duration += traj.duration().count();
                 if (!acc.accelerations) {
                     acc.accelerations.emplace();
@@ -237,7 +323,7 @@ std::shared_ptr<trajex_mlmodel_service::named_tensor_views> trajex_mlmodel_servi
 
                 auto sampler = totg::uniform_sampler::quantized_for_trajectory(traj, types::hertz{sampling_freq});
                 for (const auto& sample : traj.samples(sampler) | std::views::drop(1)) {
-                    acc.times.push_back(sample.time.count());
+                    acc.times.push_back(time_offset + sample.time.count());
                     std::ranges::copy(sample.configuration, std::back_inserter(acc.configurations));
                     std::ranges::copy(sample.velocity, std::back_inserter(acc.velocities));
                     std::ranges::copy(sample.acceleration, std::back_inserter(*acc.accelerations));
@@ -247,10 +333,11 @@ std::shared_ptr<trajex_mlmodel_service::named_tensor_views> trajex_mlmodel_servi
             planner.with_legacy(
                 [&, dof](service_result& acc, const totg::waypoint_accumulator&, const Path&, const Trajectory& traj, auto) {
                     acc.dof = dof;
+                    const double time_offset = acc.total_duration;
                     acc.total_duration += traj.getDuration();
 
                     for_each_sample(traj.getDuration(), sampling_freq, [&](double t, double) {
-                        acc.times.push_back(t);
+                        acc.times.push_back(time_offset + t);
                         auto p = traj.getPosition(t);
                         auto v = traj.getVelocity(t);
                         for (Eigen::Index j = 0; j < p.size(); ++j) {
@@ -325,12 +412,30 @@ std::shared_ptr<trajex_mlmodel_service::named_tensor_views> trajex_mlmodel_servi
             make_tensor_view(result_holder->data.accelerations->data(), n_samples * output_dof, {n_samples, output_dof}));
     }
 
+    // Compute TCP velocities if jacobian model was provided for this call
+    if (local_jac_model) {
+        auto jac_data = std::make_unique<jacobian::Data>(*local_jac_model);
+        auto& tcp_vels = result_holder->data.tcp_velocities;
+        tcp_vels.resize(n_samples);
+        for (std::size_t i = 0; i < n_samples; ++i) {
+            const auto n = static_cast<Eigen::Index>(output_dof);
+            const Eigen::Map<const Eigen::VectorXd> q(&result_holder->data.configurations[i * output_dof], n);
+            const Eigen::Map<const Eigen::VectorXd> q_dot(&result_holder->data.velocities[i * output_dof], n);
+            jacobian::computeJacobian(*local_jac_model, q, *jac_data);
+            // Linear velocity = top 3 rows of J * q_dot
+            Eigen::Vector3d linear_vel = jac_data->J.topRows(3) * q_dot;
+            tcp_vels[i] = linear_vel.norm();
+        }
+        result_holder->views.emplace("tcp_velocities_m_per_sec",
+                                     make_tensor_view(tcp_vels.data(), n_samples, {n_samples}));
+    }
+
     auto* views = &result_holder->views;
     return {std::move(result_holder), views};
 }
 
 struct trajex_mlmodel_service::metadata trajex_mlmodel_service::metadata(const vsdk::ProtoStruct&) {
-    const std::shared_lock lock{config_mutex_};
+    // No lock needed — metadata is static and does not depend on config_.
     return {
         .name = "trajex",
         .type = "other",
@@ -404,6 +509,13 @@ struct trajex_mlmodel_service::metadata trajex_mlmodel_service::metadata(const v
                  .description = "Joint accelerations over time (in radians per second squared) [n_samples, n_dof]",
                  .data_type = tensor_info::data_types::k_float64,
                  .shape = {-1, -1},
+                 .associated_files = {},
+                 .extra = {}},
+                {.name = "tcp_velocities_m_per_sec",
+                 .description = "TCP linear velocity magnitude per sample (m/s) [n_samples]. "
+                                "Conditional: only present when extra.urdf_xml is provided.",
+                 .data_type = tensor_info::data_types::k_float64,
+                 .shape = {-1},
                  .associated_files = {},
                  .extra = {}},
             },

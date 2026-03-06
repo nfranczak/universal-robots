@@ -244,6 +244,8 @@ target_link_libraries(viam-ur
     viam-cpp-sdk::viamapi # Proxy for gRPC
     viam-cpp-sdk::viamsdk
     jsoncpp_lib
+  PRIVATE
+    jacobian
 )
 
 apply_wall_werror(viam-ur)

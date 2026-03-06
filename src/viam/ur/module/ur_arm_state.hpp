@@ -8,6 +8,10 @@
 #include <thread>
 #include <variant>
 
+namespace jacobian {
+struct Model;
+}  // namespace jacobian
+
 #include <ur_client_library/types.h>
 #include <ur_client_library/ur/dashboard_client.h>
 #include <ur_client_library/ur/ur_driver.h>
@@ -85,6 +89,9 @@ class URArm::state_ {
 
     double get_max_trajectory_duration_secs() const;
     double get_trajectory_sampling_freq_hz() const;
+
+    /// Returns the parsed URDF model for Jacobian computation, or nullptr if unavailable.
+    const std::shared_ptr<jacobian::Model>& get_jacobian_model() const;
 
     void clear_pstop() const;
 
@@ -417,6 +424,10 @@ class URArm::state_ {
     const std::optional<vector6d_t> max_acceleration_limits_;
     const double trajectory_sampling_freq_hz_;
     const std::string telemetry_output_path_append_traceid_template_;
+
+    // Parsed URDF kinematic model for Jacobian computation (TCP velocity limiting).
+    // Null when no URDF is available for this arm model (e.g. ur3e, ur7e).
+    std::shared_ptr<jacobian::Model> jacobian_model_;
 
     mutable std::mutex mutex_;
     state_variant_ current_state_{state_disconnected_{}};
